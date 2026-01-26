@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Core types for the wildlife simulation
 //!
 //! These mirror the TypeScript definitions in the game server

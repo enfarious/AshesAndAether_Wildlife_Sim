@@ -1,7 +1,10 @@
+#![allow(dead_code)]
+
 //! Core simulation loop for wildlife and flora
 
 use crate::behavior::*;
 use crate::climate_subscriber::{ClimateCache, ClimateSnapshot, Season};
+use crate::weather_subscriber::{WeatherCache, WeatherSnapshot, WeatherEventType};
 use crate::plant_species::{get_plant_species, PlantType};
 use crate::species::get_species;
 use crate::types::*;
@@ -32,6 +35,10 @@ pub struct ZoneSimulation {
     // Climate system (subscribed from climate_sim via Redis)
     pub climate_cache: Option<ClimateCache>,
     pub current_climate: Option<ClimateSnapshot>,
+
+    // Weather system (subscribed from weather_sim via Redis)
+    pub weather_cache: Option<WeatherCache>,
+    pub current_weather: Option<WeatherSnapshot>,
 
     // Entities
     pub wildlife: HashMap<String, WildlifeEntity>,
@@ -65,6 +72,8 @@ impl ZoneSimulation {
             bounds_max,
             climate_cache: None,
             current_climate: None,
+            weather_cache: None,
+            current_weather: None,
 
             wildlife: HashMap::new(),
             plants: HashMap::new(),
@@ -100,6 +109,15 @@ impl ZoneSimulation {
         Ok(())
     }
 
+    /// Initialize weather subscription (call once at startup)
+    pub async fn init_weather(&mut self, redis_url: &str) -> anyhow::Result<()> {
+        let mut cache = WeatherCache::new(self.zone_id.clone());
+        cache.start_subscription(redis_url).await?;
+        self.current_weather = cache.get().await;
+        self.weather_cache = Some(cache);
+        Ok(())
+    }
+
     /// Main update tick
     pub async fn update(&mut self, now_ms: i64, delta_seconds: f64) {
         let mut rng = rand::thread_rng();
@@ -108,6 +126,13 @@ impl ZoneSimulation {
         if let Some(ref cache) = self.climate_cache {
             if let Some(snapshot) = cache.get().await {
                 self.current_climate = Some(snapshot);
+            }
+        }
+
+        // Get latest weather from cache (non-blocking)
+        if let Some(ref cache) = self.weather_cache {
+            if let Some(snapshot) = cache.get().await {
+                self.current_weather = Some(snapshot);
             }
         }
 
@@ -504,6 +529,42 @@ impl ZoneSimulation {
             .unwrap_or(30.0);
 
         let climate = self.current_climate.as_ref();
+        let weather = self.current_weather.as_ref();
+
+        // Weather hazards from active events
+        let mut hazards = Vec::new();
+        if let Some(w) = weather {
+            for event in &w.active_events {
+                let pos = Vector3 {
+                    x: event.position[0],
+                    y: event.position[1],
+                    z: event.position[2],
+                };
+                let distance = entity.position.distance_to(&pos);
+
+                let radius = match event.event_type {
+                    WeatherEventType::Storm { radius, .. } => Some(radius),
+                    WeatherEventType::Tornado { radius, .. } => Some(radius),
+                    _ => None,
+                };
+
+                if let Some(r) = radius {
+                    // Consider hazard if within radius + a buffer
+                    if distance <= r + 25.0 {
+                        hazards.push(PerceivedEntity {
+                            id: event.id.clone(),
+                            position: pos,
+                            distance,
+                            size_class: SizeClass::Large,
+                            diet_type: None,
+                            species_id: None,
+                            is_player: false,
+                        });
+                    }
+                }
+            }
+            hazards.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        }
 
         EnvironmentContext {
             current_biome: self.biome,
@@ -517,7 +578,7 @@ impl ZoneSimulation {
             nearby_mates: mates,
             season: climate.map(|c| c.season).unwrap_or(Season::Spring),
             temperature: climate.map(|c| c.temperature).unwrap_or(0.0),
-            nearby_hazards: Vec::new(), // TODO: Populate from weather events via Redis
+            nearby_hazards: hazards,
         }
     }
 

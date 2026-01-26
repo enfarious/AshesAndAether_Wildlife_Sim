@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Redis communication bridge
 //!
 //! Handles pub/sub messaging between the wildlife sim and game server.

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Plant species definitions
 //!
 //! Defines vegetables, fruit trees, grasses, and herbs with their growth parameters.

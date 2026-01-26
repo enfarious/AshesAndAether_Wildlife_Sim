@@ -11,6 +11,7 @@
 mod behavior;
 mod climate;
 mod climate_subscriber;
+mod weather_subscriber;
 mod plant_species;
 mod redis_bridge;
 mod simulation;
@@ -135,6 +136,7 @@ async fn run_offline(args: Args) -> Result<()> {
     // Start climate_sim separately with: cd climate_sim && cargo run
     info!("Initializing climate subscription (requires climate_sim running)...");
     zone.init_climate(&args.redis).await?;
+    zone.init_weather(&args.redis).await?;
     info!("Climate subscription initialized");
 
     // Add some water sources
@@ -244,11 +246,14 @@ async fn handle_game_message(
                 let mut sim = ZoneSimulation::new(zone.id.clone(), zone.biome, zone.bounds_min, zone.bounds_max);
                 
                 // Initialize climate subscription for this zone
-                if let Err(e) = sim.init_climate(redis_url).await {
+                    if let Err(e) = sim.init_climate(redis_url).await {
                     warn!("Failed to initialize climate for zone {}: {}", zone.id, e);
                 } else {
                     info!("Climate initialized for zone {}", zone.id);
                 }
+                    if let Err(e) = sim.init_weather(redis_url).await {
+                        warn!("Failed to init weather: {}", e);
+                    }
                 
                 zones.insert(zone.id, sim);
             }

@@ -131,7 +131,10 @@ impl ClimateEngine {
             // Publish to Redis
             let channel = format!("climate:zone:{}", zone_id);
             let payload = serde_json::to_string(&snapshot)?;
+            // Publish latest snapshot and cache it for consumers
             self.redis.clone().publish::<_, _, ()>(&channel, &payload).await?;
+            let key = format!("climate:snapshot:{}", zone_id);
+            let _: () = self.redis.clone().set(key, &payload).await?;
             
             // Detect and publish season changes
             if old_season != new_season {

@@ -6,6 +6,7 @@ use crate::types::*;
 use crate::climate::Season;
 
 /// Context about the environment for behavior decisions
+#[allow(dead_code)]
 pub struct EnvironmentContext {
     pub current_biome: BiomeType,
     pub biome_comfort: f64,
@@ -22,6 +23,7 @@ pub struct EnvironmentContext {
 }
 
 /// An entity perceived by wildlife
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct PerceivedEntity {
     pub id: String,
@@ -223,7 +225,7 @@ fn evaluate_drink(
 ) -> Option<BehaviorDecision> {
     // Animals drink opportunistically when water is available
     // Priority scales with thirst level
-    let mut priority = if entity.needs.thirst < thresholds::NEED_CRITICAL {
+    let priority = if entity.needs.thirst < thresholds::NEED_CRITICAL {
         90  // Critical: desperate
     } else if entity.needs.thirst < thresholds::NEED_LOW {
         70  // Low: actively seeking
@@ -269,7 +271,7 @@ fn evaluate_eat(
         return None;
     }
 
-    let mut priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
+    let priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
         85  // Critical: starving
     } else if entity.needs.hunger < thresholds::NEED_LOW {
         70  // Low: actively foraging
@@ -373,7 +375,7 @@ fn evaluate_rest(
 
 fn evaluate_mate(
     entity: &WildlifeEntity,
-    species: &WildlifeSpecies,
+    _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     if !entity.is_mature || entity.is_pregnant {
@@ -423,7 +425,7 @@ fn evaluate_mate(
 }
 
 fn evaluate_hibernation(
-    entity: &WildlifeEntity,
+    _entity: &WildlifeEntity,
     species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
@@ -480,7 +482,7 @@ fn evaluate_cold_stress(
 }
 
 fn evaluate_heat_stress(
-    entity: &WildlifeEntity,
+    _entity: &WildlifeEntity,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     // Only in summer heat
@@ -509,7 +511,7 @@ fn evaluate_heat_stress(
 }
 
 fn evaluate_storm_fleeing(
-    entity: &WildlifeEntity,
+    _entity: &WildlifeEntity,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     // Check for hazardous weather in environment
@@ -564,9 +566,10 @@ fn evaluate_desperate_hunting(
     })
 }
 
+#[allow(dead_code)]
 fn evaluate_breeding_season(
-    entity: &WildlifeEntity,
-    species: &WildlifeSpecies,
+    _entity: &WildlifeEntity,
+    _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     // Only during spring/summer
@@ -580,10 +583,11 @@ fn evaluate_breeding_season(
     }
 }
 
+#[allow(dead_code)]
 fn evaluate_nocturnal_activity(
-    entity: &WildlifeEntity,
-    species: &WildlifeSpecies,
-    context: &EnvironmentContext,
+    _entity: &WildlifeEntity,
+    _species: &WildlifeSpecies,
+    _context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     // This function modifies activity priority based on time of day
     // Nocturnal species get bonuses at night, diurnal during day
@@ -661,8 +665,6 @@ pub fn wander_direction(
     current_heading: f64,
     rng: &mut impl rand::Rng,
 ) -> f64 {
-    use rand::Rng;
-
     // Base: random offset from current heading
     let random_offset = rng.gen_range(-45.0..45.0);
     let mut heading = (current_heading + random_offset + 360.0) % 360.0;

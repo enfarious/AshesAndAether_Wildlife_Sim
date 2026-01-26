@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Species definitions for wildlife
 //!
 //! Each species is defined with its behaviors, stats, and habitat preferences.

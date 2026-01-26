@@ -58,7 +58,6 @@ impl ClimateCache {
         info!("Subscribed to climate updates: {}", channel);
 
         let cached = Arc::clone(&self.cached);
-        let zone_id = self.zone_id.clone();
 
         // Spawn background task to receive updates
         tokio::spawn(async move {

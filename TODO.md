@@ -1,8 +1,15 @@
 # Wildlife Sim - Development Roadmap
+<!-- markdownlint-disable MD022 MD031 MD032 -->
 
 A **living, chaotic world simulation** with modular tri-sim architecture. Each phase builds on emergent behavior, environmental cascades, and player-ecosystem interaction.
 
 ---
+
+## Near-Term Ops
+
+- [ ] Offline smoke: run climate_sim + weather_sim + wildlife_sim together with injected storm/tornado payloads; verify hazard caching and fleeing reactions.
+- [ ] Refresh weather tick log message to reflect 0.1 Hz rate in weather_sim startup output.
+- [ ] Silence remaining unused-variable warnings in wildlife_sim (prefix `_` or remove) to keep builds clean during test runs.
 
 ## Phase 1: Expand Behavior + Extract Climate (3-4 weeks)
 

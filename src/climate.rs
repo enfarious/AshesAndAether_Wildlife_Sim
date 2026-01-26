@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Climate and time system for the simulation
 //!
 //! Handles day/night cycles, seasons, and environmental conditions.
