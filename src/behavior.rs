@@ -221,14 +221,17 @@ fn evaluate_drink(
     _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
-    if entity.needs.thirst > thresholds::NEED_LOW {
-        return None;
-    }
-
-    let mut priority = 50;
-    if entity.needs.thirst < thresholds::NEED_CRITICAL {
-        priority = 85;
-    }
+    // Animals drink opportunistically when water is available
+    // Priority scales with thirst level
+    let mut priority = if entity.needs.thirst < thresholds::NEED_CRITICAL {
+        90  // Critical: desperate
+    } else if entity.needs.thirst < thresholds::NEED_LOW {
+        70  // Low: actively seeking
+    } else if entity.needs.thirst < thresholds::NEED_COMFORTABLE {
+        45  // Comfortable: will drink if nearby
+    } else {
+        20  // Full: low priority, but still opportunistic
+    };
 
     let water = context.nearby_water.first();
 
@@ -259,19 +262,22 @@ fn evaluate_eat(
     _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
-    if entity.needs.hunger > thresholds::NEED_LOW {
-        return None;
-    }
-
+    // Herbivores eat opportunistically when food is nearby
+    // They don't wait until starving - they graze constantly
     let food = context.nearby_food.first()?;
     if food.distance > 2.0 {
         return None;
     }
 
-    let mut priority = 65;
-    if entity.needs.hunger < thresholds::NEED_CRITICAL {
-        priority = 80;
-    }
+    let mut priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
+        85  // Critical: starving
+    } else if entity.needs.hunger < thresholds::NEED_LOW {
+        70  // Low: actively foraging
+    } else if entity.needs.hunger < thresholds::NEED_COMFORTABLE {
+        50  // Comfortable: grazing behavior
+    } else {
+        25  // Full: still nibbling if food is right there
+    };
 
     Some(BehaviorDecision {
         behavior: BehaviorState::Eating,
@@ -290,14 +296,18 @@ fn evaluate_forage(
         return None;
     }
 
-    if entity.needs.hunger > thresholds::NEED_COMFORTABLE {
-        return None;
-    }
+    // Predators hunt opportunistically when prey is nearby
+    // A fox doesn't wait until starving to take a rabbit
 
-    let mut priority = 45;
-    if entity.needs.hunger < thresholds::NEED_LOW {
-        priority = 60;
-    }
+    let mut priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
+        95  // Critical: will take risks to hunt
+    } else if entity.needs.hunger < thresholds::NEED_LOW {
+        80  // Low: actively hunting
+    } else if entity.needs.hunger < thresholds::NEED_COMFORTABLE {
+        60  // Comfortable: opportunistic hunting
+    } else {
+        30  // Full: still might hunt if easy target
+    };
     if entity.needs.hunger < thresholds::NEED_CRITICAL {
         priority = 75;
     }
@@ -321,35 +331,44 @@ fn evaluate_rest(
     species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
-    if entity.needs.energy > thresholds::NEED_LOW {
+    // Energy-based sleep priority
+    let mut priority = if entity.needs.energy < thresholds::NEED_CRITICAL {
+        100  // Exhausted: MUST sleep, even if threatened
+    } else if entity.needs.energy < thresholds::NEED_LOW {
+        80   // Tired: high priority
+    } else if entity.needs.energy < thresholds::NEED_COMFORTABLE {
+        40   // Getting tired: moderate priority
+    } else {
+        0    // Start with no base priority if energy is fine
+    };
+
+    // Don't rest if threatened UNLESS exhausted (< 15 energy)
+    if !context.nearby_threats.is_empty() && entity.needs.energy >= thresholds::NEED_CRITICAL {
         return None;
     }
 
-    // Don't rest if threatened
-    if !context.nearby_threats.is_empty() {
-        return None;
-    }
-
-    let mut priority = 30;
-    if entity.needs.energy < thresholds::NEED_CRITICAL {
-        priority = 50;
-    }
-
+    // Day/night cycle strongly influences rest
     // Nocturnal creatures rest during day
     if species.nocturnal && !context.is_night {
-        priority += 20;
+        priority += 35;
     }
     // Diurnal creatures rest at night
     if !species.nocturnal && context.is_night {
-        priority += 20;
+        priority += 35;
     }
 
-    Some(BehaviorDecision {
-        behavior: BehaviorState::Resting,
-        target_id: None,
-        target_position: None,
-        priority,
-    })
+    // Animals rest opportunistically even when not tired if it's their sleep time
+    if priority > 0 || (species.nocturnal && !context.is_night) || (!species.nocturnal && context.is_night) {
+        return Some(BehaviorDecision {
+            behavior: BehaviorState::Resting,
+            target_id: None,
+            target_position: None,
+            priority,
+        });
+    }
+
+    None
+
 }
 
 fn evaluate_mate(
@@ -361,22 +380,25 @@ fn evaluate_mate(
         return None;
     }
 
-    // Reproduction urge must be high enough (increases over time toward 100)
-    if entity.needs.reproduction < thresholds::NEED_COMFORTABLE {
-        return None;
-    }
-
-    // Basic needs must be met (hunger/thirst must be above low threshold)
-    if entity.needs.hunger < thresholds::NEED_LOW || entity.needs.thirst < thresholds::NEED_LOW {
-        return None;
-    }
-
     // Don't mate if threatened
     if !context.nearby_threats.is_empty() {
         return None;
     }
 
-    let priority = (40.0 + (entity.needs.reproduction - 60.0) * 0.3) as i32;
+    // Don't mate if starving/dehydrated (critical survival needs)
+    if entity.needs.hunger < thresholds::NEED_CRITICAL || entity.needs.thirst < thresholds::NEED_CRITICAL {
+        return None;
+    }
+
+    // Animals mate opportunistically when they see a potential mate
+    // Priority scales with reproduction urge
+    let priority = if entity.needs.reproduction > thresholds::NEED_COMFORTABLE {
+        60  // High urge: actively seeking
+    } else if entity.needs.reproduction > thresholds::NEED_LOW {
+        40  // Moderate urge: opportunistic
+    } else {
+        20  // Low urge: but still might mate if opportunity is right there
+    };
 
     match context.nearby_mates.first() {
         Some(mate) if mate.distance < 2.0 => Some(BehaviorDecision {
