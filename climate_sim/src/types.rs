@@ -1,11 +1,28 @@
-//! Climate and time system for the simulation
+//! Climate and time system types
 //!
 //! Handles day/night cycles, seasons, and environmental conditions.
 
 use serde::{Deserialize, Serialize};
 
-// Re-export Season from climate_subscriber for backward compatibility
-pub use crate::climate_subscriber::Season;
+/// Configuration for a zone's climate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneConfig {
+    pub zone_id: String,
+    pub latitude: f64,
+    pub starting_day: u16,
+    pub starting_time: f64,
+    pub time_scale: f64,  // game seconds per real second
+}
+
+/// The four seasons
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Season {
+    Spring,
+    Summer,
+    Fall,
+    Winter,
+}
 
 impl Season {
     /// Growth rate modifier for plants
@@ -144,13 +161,19 @@ impl Climate {
     }
 
     /// Get growth rate modifier for plants (0.0 to 1.5)
+    /// Now includes day_length influence for photosynthesis
     pub fn growth_rate(&self) -> f64 {
         let season_mod = self.season().growth_modifier();
+        let day_len = self.day_length();
 
-        // Reduced growth at night
-        let light_mod = if self.is_night() { 0.3 } else { 1.0 };
+        // Photosynthesis factor: more daylight = more growth
+        // Formula: 0.5 + (day_length / 24) scales from 0.5 to 1.0
+        let light_factor = 0.5 + (day_len / 24.0);
 
-        season_mod * light_mod
+        // Night penalty (no photosynthesis at night)
+        let night_penalty = if self.is_night() { 0.3 } else { 1.0 };
+
+        season_mod * light_factor * night_penalty
     }
 
     /// Format current date/time as string
@@ -195,5 +218,17 @@ mod tests {
         assert_eq!(climate.day_of_year, 1); // Rolled to next year
         assert_eq!(climate.year, 2);
         assert!((climate.time_of_day - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_growth_rate_with_day_length() {
+        let mut climate = Climate::new(200, 12.0, 42.0, 60.0); // Summer, noon
+        let summer_noon_rate = climate.growth_rate();
+        
+        climate.day_of_year = 1; // Winter
+        let winter_noon_rate = climate.growth_rate();
+        
+        // Summer should have higher growth than winter
+        assert!(summer_noon_rate > winter_noon_rate);
     }
 }

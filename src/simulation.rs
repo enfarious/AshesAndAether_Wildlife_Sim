@@ -1,7 +1,7 @@
 //! Core simulation loop for wildlife and flora
 
 use crate::behavior::*;
-use crate::climate::Climate;
+use crate::climate_subscriber::{ClimateCache, ClimateSnapshot, Season};
 use crate::plant_species::{get_plant_species, PlantType};
 use crate::species::get_species;
 use crate::types::*;
@@ -29,8 +29,9 @@ pub struct ZoneSimulation {
     pub bounds_min: Vector3,
     pub bounds_max: Vector3,
 
-    // Climate system
-    pub climate: Climate,
+    // Climate system (subscribed from climate_sim via Redis)
+    pub climate_cache: Option<ClimateCache>,
+    pub current_climate: Option<ClimateSnapshot>,
 
     // Entities
     pub wildlife: HashMap<String, WildlifeEntity>,
@@ -57,22 +58,13 @@ pub struct ZoneSimulation {
 
 impl ZoneSimulation {
     pub fn new(zone_id: String, biome: BiomeType, bounds_min: Vector3, bounds_max: Vector3) -> Self {
-        Self::with_climate(zone_id, biome, bounds_min, bounds_max, Climate::default())
-    }
-
-    pub fn with_climate(
-        zone_id: String,
-        biome: BiomeType,
-        bounds_min: Vector3,
-        bounds_max: Vector3,
-        climate: Climate,
-    ) -> Self {
         Self {
             zone_id,
             biome,
             bounds_min,
             bounds_max,
-            climate,
+            climate_cache: None,
+            current_climate: None,
 
             wildlife: HashMap::new(),
             plants: HashMap::new(),
@@ -90,15 +82,34 @@ impl ZoneSimulation {
 
     /// Get current time_of_day (for compatibility)
     pub fn time_of_day(&self) -> f64 {
-        self.climate.time_of_day
+        self.current_climate
+            .as_ref()
+            .map(|c| c.time_of_day)
+            .unwrap_or(12.0)
+    }
+
+    /// Initialize climate subscription (call once at startup)
+    pub async fn init_climate(&mut self, redis_url: &str) -> anyhow::Result<()> {
+        let cache = ClimateCache::new(self.zone_id.clone());
+        cache.start_subscription(redis_url).await?;
+        
+        // Wait for first climate update (max 5 seconds)
+        self.current_climate = cache.get_or_wait(5000).await;
+        self.climate_cache = Some(cache);
+        
+        Ok(())
     }
 
     /// Main update tick
-    pub fn update(&mut self, now_ms: i64, delta_seconds: f64) {
+    pub async fn update(&mut self, now_ms: i64, delta_seconds: f64) {
         let mut rng = rand::thread_rng();
 
-        // Advance climate/time
-        self.climate.advance(delta_seconds);
+        // Get latest climate from cache (non-blocking)
+        if let Some(ref cache) = self.climate_cache {
+            if let Some(snapshot) = cache.get().await {
+                self.current_climate = Some(snapshot);
+            }
+        }
 
         // Update all wildlife
         let entity_ids: Vec<String> = self.wildlife.keys().cloned().collect();
@@ -173,17 +184,18 @@ impl ZoneSimulation {
                 entity.needs.thirst = (entity.needs.thirst - rates.thirst * 0.1 * delta_seconds).max(0.0);
             } else {
                 // Calculate temperature stress multipliers
-                let hunger_mult = if self.climate.temperature() < -0.3 {
+                let temperature = self.current_climate.as_ref().map(|c| c.temperature).unwrap_or(0.0);
+                let hunger_mult = if temperature < -0.3 {
                     1.5 // Cold stress increases hunger
-                } else if self.climate.temperature() > 0.6 {
+                } else if temperature > 0.6 {
                     1.3 // Heat stress increases thirst more than hunger
                 } else {
                     1.0
                 };
 
-                let thirst_mult = if self.climate.temperature() > 0.6 {
+                let thirst_mult = if temperature > 0.6 {
                     1.5 // Heat stress increases thirst
-                } else if self.climate.temperature() < -0.3 {
+                } else if temperature < -0.3 {
                     1.2
                 } else {
                     1.0
@@ -256,7 +268,8 @@ impl ZoneSimulation {
             };
 
             // Apply heat stress speed penalty
-            if self.climate.temperature() > 0.6 && entity.current_behavior != BehaviorState::Hibernating {
+            let temperature = self.current_climate.as_ref().map(|c| c.temperature).unwrap_or(0.0);
+            if temperature > 0.6 && entity.current_behavior != BehaviorState::Hibernating {
                 speed *= 0.7; // 30% slower in extreme heat
             }
 
@@ -358,7 +371,7 @@ impl ZoneSimulation {
 
         if stage_changed {
             if let Some(entity) = self.wildlife.get_mut(entity_id) {
-                self.apply_stat_scaling(entity, species);
+                Self::apply_stat_scaling(entity, species);
             }
         }
 
@@ -490,18 +503,20 @@ impl ZoneSimulation {
             .map(|p| p.comfort)
             .unwrap_or(30.0);
 
+        let climate = self.current_climate.as_ref();
+
         EnvironmentContext {
             current_biome: self.biome,
             biome_comfort,
-            time_of_day: self.climate.time_of_day,
-            is_night: self.climate.is_night(),
+            time_of_day: climate.map(|c| c.time_of_day).unwrap_or(12.0),
+            is_night: climate.map(|c| c.is_night).unwrap_or(false),
             nearby_threats: threats,
             nearby_prey: prey,
             nearby_food,
             nearby_water,
             nearby_mates: mates,
-            season: self.climate.season(),
-            temperature: self.climate.temperature(),
+            season: climate.map(|c| c.season).unwrap_or(Season::Spring),
+            temperature: climate.map(|c| c.temperature).unwrap_or(0.0),
             nearby_hazards: Vec::new(), // TODO: Populate from weather events via Redis
         }
     }
@@ -556,8 +571,14 @@ impl ZoneSimulation {
 
             let attacker_pos = attacker.position;
 
-            let target = self.wildlife.get_mut(&target_id).unwrap();
-            target.current_health -= damage;
+            // Apply damage to target (in separate block to release borrow)
+            let target_died = {
+                let target = self.wildlife.get_mut(&target_id).unwrap();
+                target.current_health -= damage;
+                target.current_health <= 0.0
+            };
+
+            // Award XP for the hit
             self.award_experience(&attacker_id, 2.0);
 
             self.pending_events.push(WildlifeEvent::Attack {
@@ -567,10 +588,11 @@ impl ZoneSimulation {
                 position: attacker_pos,
             });
 
-            if target.current_health <= 0.0 {
+            if target_died {
                 // Calculate food value from prey before killing it
-                let prey_species = get_species(&target.species_id);
+                let prey_species = get_species(&self.wildlife.get(&target_id).unwrap().species_id);
                 let food_value = prey_species
+                    .as_ref()
                     .map(|s| {
                         // Food value based on prey size class
                         match s.size_class {
@@ -602,8 +624,10 @@ impl ZoneSimulation {
                 }
             } else {
                 // Target starts fleeing
-                target.current_behavior = BehaviorState::Fleeing;
-                target.fleeing_until = now_ms + 10_000;
+                if let Some(target) = self.wildlife.get_mut(&target_id) {
+                    target.current_behavior = BehaviorState::Fleeing;
+                    target.fleeing_until = now_ms + 10_000;
+                }
                 self.award_experience(&target_id, 1.0);
             }
         }
@@ -943,7 +967,7 @@ impl ZoneSimulation {
             last_hostile_at: 0,
         };
 
-        self.apply_stat_scaling(&mut entity, &species);
+        Self::apply_stat_scaling(&mut entity, &species);
 
         Some(entity)
     }
@@ -1030,7 +1054,7 @@ impl ZoneSimulation {
         50.0 + (level as f64 * 25.0)
     }
 
-    fn apply_stat_scaling(&self, entity: &mut WildlifeEntity, species: &WildlifeSpecies) {
+    fn apply_stat_scaling(entity: &mut WildlifeEntity, species: &WildlifeSpecies) {
         let age_stage = Self::age_stage_for(entity.age, species.maturity_time);
         let (age_health_mult, age_damage_mult) = match age_stage {
             WildlifeAgeStage::Juvenile => (0.75, 0.7),
@@ -1090,7 +1114,7 @@ impl ZoneSimulation {
         entity.experience = new_exp;
         entity.experience_to_next = next;
 
-        self.apply_stat_scaling(entity, &species);
+        Self::apply_stat_scaling(entity, &species);
     }
 
     fn size_class_xp(size_class: SizeClass) -> f64 {
@@ -1122,11 +1146,14 @@ impl ZoneSimulation {
             None => return,
         };
 
-        let current_season = self.climate.season();
+        let current_season = self.current_climate
+            .as_ref()
+            .map(|c| c.season)
+            .unwrap_or(Season::Spring);
 
         // Check dormancy
         let should_be_dormant = species.dormant_in_winter
-            && current_season == crate::climate::Season::Winter;
+            && current_season == Season::Winter;
 
         // Get current stage config
         let stage_config = species.growth_stages.get(plant.stage_index);
@@ -1139,7 +1166,7 @@ impl ZoneSimulation {
         let growth_rate = if should_be_dormant {
             0.0
         } else if species.growing_seasons.contains(&current_season) {
-            self.climate.growth_rate()
+            self.current_climate.as_ref().map(|c| c.growth_rate).unwrap_or(0.5)
         } else {
             0.1 // Minimal growth outside growing season
         };

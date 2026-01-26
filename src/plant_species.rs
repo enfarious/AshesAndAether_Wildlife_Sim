@@ -2,7 +2,7 @@
 //!
 //! Defines vegetables, fruit trees, grasses, and herbs with their growth parameters.
 
-use crate::climate::Season;
+use crate::climate_subscriber::Season;
 use crate::types::{BiomeType, PlantGrowthStage};
 use std::collections::HashMap;
 use std::sync::LazyLock;

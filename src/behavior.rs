@@ -50,7 +50,7 @@ pub struct BehaviorDecision {
 /// Select the best behavior for an entity given its state and environment
 pub fn select_behavior(
     entity: &WildlifeEntity,
-    _species: &WildlifeSpecies,
+    species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> BehaviorDecision {
     let mut candidates = Vec::new();
@@ -90,10 +90,10 @@ pub fn select_behavior(
     if let Some(decision) = evaluate_hunt(entity, species, context) {
         candidates.push(decision);
     }
-    if let Some(decision) = evaluate_drink(entity, context) {
+    if let Some(decision) = evaluate_drink(entity, species, context) {
         candidates.push(decision);
     }
-    if let Some(decision) = evaluate_eat(entity, context) {
+    if let Some(decision) = evaluate_eat(entity, species, context) {
         candidates.push(decision);
     }
     if let Some(decision) = evaluate_forage(entity, species, context) {
@@ -126,7 +126,7 @@ pub fn select_behavior(
 }
 
 fn evaluate_flee(
-    _entity: &WildlifeEntity,
+    entity: &WildlifeEntity,
     species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
@@ -166,7 +166,7 @@ fn evaluate_flee(
 }
 
 fn evaluate_hunt(
-    _entity: &WildlifeEntity,
+    entity: &WildlifeEntity,
     species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
@@ -217,7 +217,8 @@ fn evaluate_hunt(
 }
 
 fn evaluate_drink(
-    _entity: &WildlifeEntity,
+    entity: &WildlifeEntity,
+    _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     if entity.needs.thirst > thresholds::NEED_LOW {
@@ -254,7 +255,8 @@ fn evaluate_drink(
 }
 
 fn evaluate_eat(
-    _entity: &WildlifeEntity,
+    entity: &WildlifeEntity,
+    _species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     if entity.needs.hunger > thresholds::NEED_LOW {
@@ -281,7 +283,7 @@ fn evaluate_eat(
 
 fn evaluate_forage(
     entity: &WildlifeEntity,
-    _species: &WildlifeSpecies,
+    species: &WildlifeSpecies,
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     if !species.is_herbivore {
@@ -315,9 +317,9 @@ fn evaluate_forage(
 }
 
 fn evaluate_rest(
-    _entity: &WildlifeEntity,
-    _species: &WildlifeSpecies,
-    _context: &EnvironmentContext,
+    entity: &WildlifeEntity,
+    species: &WildlifeSpecies,
+    context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     if entity.needs.energy > thresholds::NEED_LOW {
         return None;

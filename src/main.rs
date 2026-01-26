@@ -10,6 +10,7 @@
 
 mod behavior;
 mod climate;
+mod climate_subscriber;
 mod plant_species;
 mod redis_bridge;
 mod simulation;
@@ -97,12 +98,12 @@ async fn run_with_redis(args: Args) -> Result<()> {
 
             // Process incoming messages
             while let Some(msg) = bridge.try_recv() {
-                handle_game_message(&mut zones, msg);
+                handle_game_message(&mut zones, msg, &args.redis).await;
             }
 
             // Update all zones
             for zone in zones.values_mut() {
-                zone.update(now_ms, delta_seconds);
+                zone.update(now_ms, delta_seconds).await;
 
                 // Publish events
                 let events = zone.take_events();
@@ -122,22 +123,19 @@ async fn run_with_redis(args: Args) -> Result<()> {
 }
 
 async fn run_offline(args: Args) -> Result<()> {
-    // Create climate with configurable time scale
-    let climate = climate::Climate::new(
-        80,              // Day 80 = late March (early spring)
-        8.0,             // 8 AM
-        42.0,            // NY latitude
-        args.time_scale, // Configurable time scale
-    );
-
-    // Create a test zone with climate
-    let mut zone = ZoneSimulation::with_climate(
+    // Create a test zone
+    let mut zone = ZoneSimulation::new(
         "test_zone".to_string(),
         BiomeType::Grassland,
         Vector3::new(-100.0, 0.0, -100.0),
         Vector3::new(100.0, 0.0, 100.0),
-        climate,
     );
+
+    // NOTE: Offline mode still requires Redis for climate_sim!
+    // Start climate_sim separately with: cd climate_sim && cargo run
+    info!("Initializing climate subscription (requires climate_sim running)...");
+    zone.init_climate(&args.redis).await?;
+    info!("Climate subscription initialized");
 
     // Add some water sources
     zone.water_sources = vec![
@@ -169,7 +167,7 @@ async fn run_offline(args: Args) -> Result<()> {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let delta_seconds = elapsed.as_secs_f64();
 
-            zone.update(now_ms, delta_seconds);
+            zone.update(now_ms, delta_seconds).await;
 
             // Log significant events only (skip move events)
             let events = zone.take_events();
@@ -188,9 +186,14 @@ async fn run_offline(args: Args) -> Result<()> {
             let alive_count = zone.wildlife.values().filter(|e| e.is_alive).count();
             let alive_plants = zone.plants.values().filter(|p| p.is_alive).count();
 
+            let climate_str = zone.current_climate
+                .as_ref()
+                .map(|c| format!("Day {} {:02}:{:02}", c.day_of_year, c.time_of_day as u32, ((c.time_of_day % 1.0) * 60.0) as u32))
+                .unwrap_or_else(|| "No climate data".to_string());
+
             info!(
                 "=== {} | {} wildlife, {} plants ===",
-                zone.climate.format(),
+                climate_str,
                 alive_count,
                 alive_plants
             );
@@ -228,17 +231,27 @@ async fn run_offline(args: Args) -> Result<()> {
     }
 }
 
-fn handle_game_message(zones: &mut HashMap<String, ZoneSimulation>, msg: GameServerMessage) {
+async fn handle_game_message(
+    zones: &mut HashMap<String, ZoneSimulation>,
+    msg: GameServerMessage,
+    redis_url: &str,
+) {
     match msg {
         GameServerMessage::ZoneInfo { zone } => {
             info!("Received zone info: {} ({:?})", zone.id, zone.biome);
 
-            let sim = zones
-                .entry(zone.id.clone())
-                .or_insert_with(|| {
-                    ZoneSimulation::new(zone.id, zone.biome, zone.bounds_min, zone.bounds_max)
-                });
-            sim.climate.time_of_day = zone.time_of_day;
+            if !zones.contains_key(&zone.id) {
+                let mut sim = ZoneSimulation::new(zone.id.clone(), zone.biome, zone.bounds_min, zone.bounds_max);
+                
+                // Initialize climate subscription for this zone
+                if let Err(e) = sim.init_climate(redis_url).await {
+                    warn!("Failed to initialize climate for zone {}: {}", zone.id, e);
+                } else {
+                    info!("Climate initialized for zone {}", zone.id);
+                }
+                
+                zones.insert(zone.id, sim);
+            }
         }
 
         GameServerMessage::PlayersUpdate { players } => {
