@@ -194,9 +194,12 @@ async fn main() -> Result<()> {
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
+    let zone_id = std::env::var("ZONE_ID")
+        .unwrap_or_else(|_| "USA_NY_Stephentown".to_string());
+
     let configs = vec![
         ZoneConfig {
-            zone_id: "test_zone".to_string(),
+            zone_id,
             latitude: 42.0,        // NY latitude
             starting_day: 80,      // Day 80 = late March (spring)
             starting_time: 8.0,    // 8 AM

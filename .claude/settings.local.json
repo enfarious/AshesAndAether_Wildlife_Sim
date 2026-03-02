@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -d \"F:\\\\Projects\\\\AshesAndAether\\\\AshesAndAether_Server\"/*/)",
+      "Bash(xargs grep -l \"router\\\\|route\\\\|endpoint\")",
+      "Bash(cargo build)",
+      "Bash(cargo check)",
+      "Bash(xargs grep -l \"class.*Weather\\\\|export.*weather\\\\|interface.*Weather\")",
+      "Bash(npx tsc --noEmit)",
+      "Bash(xargs grep -l \"worldTile\\\\|WorldTile\")",
+      "Bash(npx tsc --noEmit --pretty)"
+    ]
+  }
+}

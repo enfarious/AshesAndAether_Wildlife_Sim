@@ -20,6 +20,12 @@ pub struct EnvironmentContext {
     pub nearby_water: Vec<WaterSource>,
     pub nearby_mates: Vec<PerceivedEntity>,
     pub nearby_hazards: Vec<PerceivedEntity>,
+    /// Nearest shelter position (damaged/collapsed structures) from terrain.
+    pub nearby_shelter: Option<Vector3>,
+    /// Whether the entity is currently on a road cell.
+    pub on_road: bool,
+    /// Whether the entity is near dense vegetation or ruins (cover from threats).
+    pub near_cover: bool,
 }
 
 /// An entity perceived by wildlife
@@ -473,12 +479,22 @@ fn evaluate_cold_stress(
     let energy_urgency = if entity.needs.energy < thresholds::NEED_LOW { 20 } else { 10 };
     let priority = 55 + hunger_urgency + energy_urgency;
 
-    Some(BehaviorDecision {
-        behavior: BehaviorState::Resting, // Seek shelter/rest to conserve energy
-        target_id: None,
-        target_position: None,
-        priority,
-    })
+    // Seek shelter if available — pathfind to nearest shelter structure
+    if let Some(shelter) = context.nearby_shelter {
+        Some(BehaviorDecision {
+            behavior: BehaviorState::Wandering, // Move toward shelter, then rest
+            target_id: None,
+            target_position: Some(shelter),
+            priority,
+        })
+    } else {
+        Some(BehaviorDecision {
+            behavior: BehaviorState::Resting, // No shelter — hunker down
+            target_id: None,
+            target_position: None,
+            priority,
+        })
+    }
 }
 
 fn evaluate_heat_stress(
@@ -515,18 +531,27 @@ fn evaluate_storm_fleeing(
     context: &EnvironmentContext,
 ) -> Option<BehaviorDecision> {
     // Check for hazardous weather in environment
-    // (This would be populated by weather events from Redis)
     let dangerous_weather = context.nearby_hazards.first()?;
 
-    // High priority to flee storms
+    // High priority to flee storms — prefer shelter if available
     let priority = 90;
 
-    Some(BehaviorDecision {
-        behavior: BehaviorState::Fleeing,
-        target_id: None,
-        target_position: Some(dangerous_weather.position), // Flee away from hazard center
-        priority,
-    })
+    if let Some(shelter) = context.nearby_shelter {
+        // Head toward shelter rather than just fleeing blindly
+        Some(BehaviorDecision {
+            behavior: BehaviorState::Fleeing,
+            target_id: None,
+            target_position: Some(shelter),
+            priority,
+        })
+    } else {
+        Some(BehaviorDecision {
+            behavior: BehaviorState::Fleeing,
+            target_id: None,
+            target_position: Some(dangerous_weather.position), // Flee away from hazard center
+            priority,
+        })
+    }
 }
 
 fn evaluate_desperate_hunting(

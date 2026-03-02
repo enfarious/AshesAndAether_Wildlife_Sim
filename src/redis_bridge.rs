@@ -123,6 +123,67 @@ impl RedisBridge {
         Ok(())
     }
 
+    /// Fetch zone info snapshots stored by the game server.
+    ///
+    /// The WildlifeBridge on the server SETs `wildlife:zone_snapshot:{zoneId}`
+    /// keys so late-connecting sims can prime their zone list without waiting
+    /// for the next periodic publish on the pubsub channel.
+    pub async fn fetch_zone_snapshots(&mut self, zone_filter: &str) -> Vec<GameServerMessage> {
+        let mut results = Vec::new();
+
+        // If we have a specific zone ID, check just that key
+        if zone_filter != "all" {
+            let key = format!("wildlife:zone_snapshot:{}", zone_filter);
+            let val: Option<String> = match self.connection.get(&key).await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("No zone snapshot at {}: {}", key, e);
+                    None
+                }
+            };
+            if let Some(payload) = val {
+                match serde_json::from_str::<GameServerMessage>(&payload) {
+                    Ok(msg) => {
+                        info!("Primed zone from snapshot key: {}", key);
+                        results.push(msg);
+                    }
+                    Err(e) => warn!("Failed to parse zone snapshot {}: {}", key, e),
+                }
+            }
+        } else {
+            // Scan for all wildlife:zone_snapshot:* keys
+            let keys: Vec<String> = match redis::cmd("KEYS")
+                .arg("wildlife:zone_snapshot:*")
+                .query_async(&mut self.connection)
+                .await
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    debug!("Failed to scan zone snapshot keys: {}", e);
+                    Vec::new()
+                }
+            };
+
+            for key in &keys {
+                let val: Option<String> = match self.connection.get(key).await {
+                    Ok(v) => v,
+                    Err(_) => None,
+                };
+                if let Some(payload) = val {
+                    match serde_json::from_str::<GameServerMessage>(&payload) {
+                        Ok(msg) => {
+                            info!("Primed zone from snapshot key: {}", key);
+                            results.push(msg);
+                        }
+                        Err(e) => warn!("Failed to parse zone snapshot {}: {}", key, e),
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
     /// Publish full state for a zone (for sync)
     pub async fn publish_state(
         &mut self,

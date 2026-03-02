@@ -38,5 +38,11 @@ clap = { version = "4", features = ["derive"] }
 # Async stream utilities
 futures-util = "0.3"
 
+# HTTP client for fetching terrain data from server
+reqwest = { version = "0.12", features = ["json"] }
+
+# Bitflags for walkability flags
+bitflags = "2"
+
 [dev-dependencies]
 tokio-test = "0.4"

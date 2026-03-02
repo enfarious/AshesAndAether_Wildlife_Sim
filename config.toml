@@ -1,0 +1,33 @@
+# ──────────────────────────────────────────────────────────────
+# Wildlife Simulation — config.toml
+# ──────────────────────────────────────────────────────────────
+# Values here are used as defaults.  CLI flags override them:
+#   cargo run -- --offline --tick-rate 20
+# ──────────────────────────────────────────────────────────────
+
+# Redis connection URL (required for climate/weather subscriptions)
+redis = "redis://127.0.0.1:6379"
+
+# Zone ID to simulate.
+# In offline mode this sets the Redis channel names (climate:zone:{zone}, etc.)
+# so it MUST match the game server's zone ID for the bridges to connect.
+# Use "all" in online mode to accept every zone the server announces.
+zone = "USA_NY_Stephentown"
+
+# Simulation tick rate in Hz
+tick_rate = 10
+
+# Run without the game server message loop (still uses Redis for climate/weather)
+offline = false
+
+# Game-time multiplier  (60 = 1 real second is 1 game minute)
+time_scale = 60
+
+# Game server URL (terrain API, zone announcements)
+server_url = "http://127.0.0.1:3100"
+
+# Tile to load: a specific tile ID, "auto" (first from manifest), or "none"
+tile = "auto"
+
+# Fallback terrain size in world metres (used when server has no tile data)
+tile_size = 200.0

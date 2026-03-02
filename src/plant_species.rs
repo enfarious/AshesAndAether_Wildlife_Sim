@@ -70,13 +70,17 @@ pub struct PlantSpecies {
 pub static PLANT_SPECIES: LazyLock<HashMap<&'static str, PlantSpecies>> = LazyLock::new(|| {
     let mut map = HashMap::new();
 
-    map.insert("grass", grass());
-    map.insert("carrot", carrot());
-    map.insert("potato", potato());
-    map.insert("onion", onion());
-    map.insert("garlic", garlic());
-    map.insert("apple_tree", apple_tree());
-    map.insert("pear_tree", pear_tree());
+    map.insert("grass",       grass());
+    map.insert("carrot",      carrot());
+    map.insert("potato",      potato());
+    map.insert("onion",       onion());
+    map.insert("garlic",      garlic());
+    map.insert("apple_tree",  apple_tree());
+    map.insert("pear_tree",   pear_tree());
+    map.insert("clover",      clover());
+    map.insert("herb_sage",   herb_sage());
+    map.insert("mushroom",    mushroom());
+    map.insert("berry_bush",  berry_bush());
 
     map
 });
@@ -461,5 +465,118 @@ fn pear_tree() -> PlantSpecies {
 
         preferred_biomes: vec![BiomeType::Forest, BiomeType::Grassland],
         spawn_weight: 0.4,
+    }
+}
+
+fn clover() -> PlantSpecies {
+    PlantSpecies {
+        id: "clover",
+        name: "Clover",
+        plant_type: PlantType::Herb,
+
+        total_growth_time: 315.0,
+        growth_stages: vec![
+            GrowthStageConfig { stage: PlantGrowthStage::Seed,      duration_ratio: 0.14, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Sprout,    duration_ratio: 0.29, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Growing,   duration_ratio: 0.29, can_be_eaten: true,  can_be_harvested: false, food_value: 12.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Mature,    duration_ratio: 0.20, can_be_eaten: true,  can_be_harvested: true,  food_value: 25.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Flowering, duration_ratio: 0.08, can_be_eaten: true,  can_be_harvested: true,  food_value: 28.0 },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall],
+        harvest_seasons: vec![Season::Summer],
+        dormant_in_winter: true,
+
+        harvest_item: "clover",
+        harvest_yield: (2, 5),
+        regrows_after_harvest: true,
+        regrow_stage: PlantGrowthStage::Growing,
+
+        preferred_biomes: vec![BiomeType::Grassland, BiomeType::Forest, BiomeType::Coastal],
+        spawn_weight: 8.0,
+    }
+}
+
+fn herb_sage() -> PlantSpecies {
+    PlantSpecies {
+        id: "herb_sage",
+        name: "Wild Sage",
+        plant_type: PlantType::Herb,
+
+        total_growth_time: 480.0,
+        growth_stages: vec![
+            GrowthStageConfig { stage: PlantGrowthStage::Seed,      duration_ratio: 0.12, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Sprout,    duration_ratio: 0.25, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Growing,   duration_ratio: 0.31, can_be_eaten: true,  can_be_harvested: false, food_value: 5.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Mature,    duration_ratio: 0.19, can_be_eaten: true,  can_be_harvested: true,  food_value: 10.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Flowering, duration_ratio: 0.13, can_be_eaten: true,  can_be_harvested: true,  food_value: 12.0 },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall],
+        harvest_seasons: vec![Season::Summer, Season::Fall],
+        dormant_in_winter: true,
+
+        harvest_item: "herb_sage",
+        harvest_yield: (1, 3),
+        regrows_after_harvest: true,
+        regrow_stage: PlantGrowthStage::Growing,
+
+        preferred_biomes: vec![BiomeType::Grassland, BiomeType::Mountain, BiomeType::Forest],
+        spawn_weight: 2.5,
+    }
+}
+
+fn mushroom() -> PlantSpecies {
+    PlantSpecies {
+        id: "mushroom",
+        name: "Forest Mushroom",
+        plant_type: PlantType::Herb,  // Closest existing type; Mushroom type could be added later
+
+        total_growth_time: 180.0,
+        growth_stages: vec![
+            GrowthStageConfig { stage: PlantGrowthStage::Sprout,    duration_ratio: 0.33, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Growing,   duration_ratio: 0.34, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Mature,    duration_ratio: 0.33, can_be_eaten: true,  can_be_harvested: true,  food_value: 25.0 },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall],
+        harvest_seasons: vec![Season::Spring, Season::Summer, Season::Fall],
+        dormant_in_winter: true,
+
+        harvest_item: "mushroom",
+        harvest_yield: (1, 3),
+        regrows_after_harvest: true,
+        regrow_stage: PlantGrowthStage::Sprout,
+
+        preferred_biomes: vec![BiomeType::Forest, BiomeType::Swamp, BiomeType::Underground],
+        spawn_weight: 4.0,
+    }
+}
+
+fn berry_bush() -> PlantSpecies {
+    PlantSpecies {
+        id: "berry_bush",
+        name: "Berry Bush",
+        plant_type: PlantType::Herb,  // Bush type could be added later
+
+        total_growth_time: 720.0,
+        growth_stages: vec![
+            GrowthStageConfig { stage: PlantGrowthStage::Sprout,    duration_ratio: 0.17, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Growing,   duration_ratio: 0.28, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Mature,    duration_ratio: 0.22, can_be_eaten: false, can_be_harvested: false, food_value: 0.0 },
+            GrowthStageConfig { stage: PlantGrowthStage::Flowering, duration_ratio: 0.33, can_be_eaten: true,  can_be_harvested: true,  food_value: 20.0 },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall],
+        harvest_seasons: vec![Season::Summer, Season::Fall],
+        dormant_in_winter: true,
+
+        harvest_item: "berries",
+        harvest_yield: (3, 8),
+        regrows_after_harvest: true,
+        regrow_stage: PlantGrowthStage::Mature,
+
+        preferred_biomes: vec![BiomeType::Forest, BiomeType::Grassland, BiomeType::Coastal],
+        spawn_weight: 3.5,
     }
 }
