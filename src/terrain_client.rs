@@ -19,7 +19,11 @@ impl TerrainClient {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -90,13 +94,14 @@ impl TerrainClient {
 
     /// Fetch tile data and build a TerrainGrid.
     ///
-    /// `tile_size` is the world-space size of the tile in meters (typically ~2500).
-    /// `origin` is the world-space origin (min corner) of the tile.
+    /// `fallback_tile_size` is the world-space size of the tile in meters, used only
+    /// when the server navmesh doesn't provide enough data to compute it.
+    /// The actual tile size is derived from `navmesh.resolution * navmesh.cell_size`.
     pub async fn fetch_and_build_grid(
         &self,
         tile_id: &str,
-        tile_size: f64,
-        origin: Vector3,
+        fallback_tile_size: f64,
+        _origin: Vector3,
     ) -> Result<TerrainGrid> {
         let data = self.fetch_tile(tile_id).await?;
 
@@ -105,6 +110,29 @@ impl TerrainClient {
             .as_ref()
             .context("Tile has no navmesh data")?;
 
+        // Derive tile_size from the server's navmesh metadata instead of trusting
+        // the config value.  The server's NavmeshPipeline sets:
+        //   resolution = 64, cell_size = tileSize / resolution  (~39m for 2500m tiles)
+        // so  resolution * cell_size == actual tile extent in world meters.
+        let server_tile_size = navmesh.resolution as f64 * navmesh.cell_size;
+        let tile_size = if server_tile_size > 1.0 {
+            info!(
+                "Tile {}: using server-derived tile_size={:.1}m ({}×{:.2}m cells)",
+                tile_id, server_tile_size, navmesh.resolution, navmesh.cell_size
+            );
+            server_tile_size
+        } else {
+            warn!(
+                "Tile {}: server navmesh cell_size looks wrong ({:.4}), using fallback tile_size={:.1}m",
+                tile_id, navmesh.cell_size, fallback_tile_size
+            );
+            fallback_tile_size
+        };
+
+        // Center the terrain grid at world origin (the game server places zone
+        // origin at 0,0 so -half..+half covers the zone).
+        let origin = Vector3::new(-tile_size / 2.0, 0.0, -tile_size / 2.0);
+
         let grid = TerrainGrid::from_server_data(
             tile_id.to_string(),
             tile_size,
@@ -112,6 +140,8 @@ impl TerrainClient {
             navmesh,
             data.biome.as_ref(),
             data.ruins.as_ref(),
+            data.elevation.as_ref(),
+            data.geometry.as_ref(),
         );
 
         let walkable_count = grid
@@ -135,14 +165,30 @@ impl TerrainClient {
             .filter(|c| c.walkability.contains(WalkabilityFlags::ROAD))
             .count();
 
+        info!(
+            "OSM geometry for tile {}: {} buildings, {} roads",
+            tile_id,
+            grid.osm_buildings.len(),
+            grid.osm_roads.len(),
+        );
+        if !grid.osm_buildings.is_empty() {
+            // Log the first building's first vertex to verify coordinate system
+            let b = &grid.osm_buildings[0];
+            if !b.is_empty() {
+                info!("  First building vertex: ({:.1}, {:.1})", b[0][0], b[0][1]);
+            }
+        }
+
         let total = GRID_CELLS as f64;
         info!(
-            "Built terrain grid for tile {}: {}x{} cells, {:.1}% walkable, \
-             {:.1}% water, {:.1}% structures, {:.1}% roads, \
+            "Built terrain grid for tile {}: {}x{} cells ({:.0}m tile, {:.1}m/cell), \
+             {:.1}% walkable, {:.1}% water, {:.1}% structures, {:.1}% roads, \
              elevation {:.0}-{:.0}m",
             tile_id,
             GRID_RESOLUTION,
             GRID_RESOLUTION,
+            grid.tile_size,
+            grid.cell_size,
             walkable_count as f64 / total * 100.0,
             water_count as f64 / total * 100.0,
             structure_count as f64 / total * 100.0,
@@ -221,6 +267,10 @@ pub fn generate_fallback_terrain(tile_size: f64, origin: Vector3) -> TerrainGrid
         cells,
         structures: vec![],
         roads: vec![],
+        osm_buildings: vec![],
+        osm_roads: vec![],
+        fine_building_grid: None,
+        fine_road_grid: None,
     }
 }
 

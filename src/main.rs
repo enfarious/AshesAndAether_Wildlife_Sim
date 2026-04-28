@@ -9,7 +9,9 @@
 //! ```
 
 mod behavior;
+mod civic_map;
 mod climate;
+mod forest_map;
 mod climate_subscriber;
 mod pathfinding;
 mod plant_species;
@@ -23,9 +25,12 @@ mod weather_subscriber;
 
 use anyhow::Result;
 use clap::Parser;
+use civic_map::CivicMap;
+use forest_map::ForestMap;
 use serde::Deserialize;
-use simulation::ZoneSimulation;
+use simulation::{CachedPlant, ZoneSimulation};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use types::*;
@@ -72,6 +77,28 @@ struct CliArgs {
 }
 
 /// Resolved configuration (config file defaults + CLI overrides).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct FloraConfig {
+    zone_tree_multiplier:    f64,
+    forest_tree_multiplier:  f64,
+    tree_building_clearance: f64,
+    tree_road_clearance:     f64,
+    tree_water_clearance:    f64,
+}
+
+impl Default for FloraConfig {
+    fn default() -> Self {
+        Self {
+            zone_tree_multiplier:    3.0,
+            forest_tree_multiplier:  10.0,
+            tree_building_clearance: 20.0,
+            tree_road_clearance:     10.0,
+            tree_water_clearance:    5.0,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct Config {
@@ -83,6 +110,7 @@ struct Config {
     server_url: String,
     tile: String,
     tile_size: f64,
+    flora: FloraConfig,
 }
 
 impl Default for Config {
@@ -93,9 +121,10 @@ impl Default for Config {
             tick_rate: 10,
             offline: false,
             time_scale: 60.0,
-            server_url: "http://127.0.0.1:3000".into(),
+            server_url: "http://127.0.0.1:3100".into(),
             tile: "auto".into(),
             tile_size: 200.0,
+            flora: FloraConfig::default(),
         }
     }
 }
@@ -149,8 +178,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wildlife_sim=debug".parse()?)
-                .add_directive("info".parse()?),
+                .add_directive("wildlife_sim=info".parse()?)
+                .add_directive("warn".parse()?),
         )
         .init();
 
@@ -191,7 +220,7 @@ async fn run_with_redis(args: Config) -> Result<()> {
     } else {
         info!("Found {} zone snapshot(s) — priming zones", snapshots.len());
         for msg in snapshots {
-            handle_game_message(&mut zones, msg, &args.redis, &terrain).await;
+            handle_game_message(&mut zones, msg, &args.redis, &args.server_url, &terrain, args.time_scale, &args.flora).await;
         }
     }
 
@@ -208,11 +237,15 @@ async fn run_with_redis(args: Config) -> Result<()> {
 
         if elapsed >= tick_duration {
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let delta_seconds = elapsed.as_secs_f64();
+            // Cap at 2× the target tick interval so a slow tick can't produce
+            // a giant movement step and visible animal teleport. The sim still
+            // advances time, just at a bounded rate when overloaded.
+            let max_delta = (tick_duration.as_secs_f64() * 2.0).min(0.25);
+            let delta_seconds = elapsed.as_secs_f64().min(max_delta);
 
             // Process incoming messages
             while let Some(msg) = bridge.try_recv() {
-                handle_game_message(&mut zones, msg, &args.redis, &terrain).await;
+                handle_game_message(&mut zones, msg, &args.redis, &args.server_url, &terrain, args.time_scale, &args.flora).await;
             }
 
             // Periodically re-announce all entities so that late-connecting
@@ -225,16 +258,27 @@ async fn run_with_redis(args: Config) -> Result<()> {
             }
 
             // Update all zones
+            let tick_start = Instant::now();
             for zone in zones.values_mut() {
                 zone.update(now_ms, delta_seconds).await;
 
                 // Publish events
                 let events = zone.take_events();
                 if !events.is_empty() {
-                    if let Err(e) = bridge.publish_events(events).await {
+                    if let Err(e) = bridge.publish_events(&zone.zone_id, events).await {
                         warn!("Failed to publish events: {}", e);
                     }
                 }
+            }
+
+            // Warn if a tick took >2× the budget — diagnoses sim overload.
+            let tick_elapsed = tick_start.elapsed();
+            if tick_elapsed > tick_duration * 2 {
+                warn!(
+                    "Tick over budget: {} ms (target {} ms)",
+                    tick_elapsed.as_millis(),
+                    tick_duration.as_millis(),
+                );
             }
 
             last_tick = now;
@@ -279,6 +323,10 @@ async fn run_offline(args: Config) -> Result<()> {
         ];
     }
 
+    // Set internal climate time scale to match configuration
+    zone.set_time_scale(args.time_scale);
+    zone.set_flora_config(&args.flora);
+
     // Offline mode still uses Redis for climate_sim and for publishing
     // wildlife events so the game server bridge can pick them up.
     info!("Initializing Redis connection for climate + event publishing...");
@@ -287,20 +335,28 @@ async fn run_offline(args: Config) -> Result<()> {
     zone.init_weather(&args.redis).await?;
     info!("Redis initialized (climate + event publishing)");
 
-    // Spawn initial populations
+    // Spawn initial populations (density-scaled to zone area)
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let rabbits = zone.spawn_population("rabbit", 3, 7, now_ms);
-    let foxes = zone.spawn_population("fox", 2, 4, now_ms);
-    let deer = zone.spawn_population("deer", 2, 5, now_ms);
-    let wolves = zone.spawn_population("wolf", 1, 3, now_ms);
-    let boars = zone.spawn_population("boar", 2, 4, now_ms);
-    info!(
-        "Spawned initial population: {} rabbits, {} foxes, {} deer, {} wolves, {} boars",
-        rabbits, foxes, deer, wolves, boars
-    );
+    info!("Zone area: {:.2} km² — scaling populations to match", zone.zone_area_km2());
+    for (species, males, females) in density_scaled_populations(&zone) {
+        let count = zone.spawn_population(species, males, females, now_ms);
+        info!("  Spawned {} {} ({}M + {}F)", count, species, males, females);
+    }
 
-    // Spawn initial plants
-    zone.spawn_initial_plants(now_ms);
+    // Load forest polygons so trees are restricted to OSM wood/forest areas
+    let zone_id_for_forest = if args.zone == "all" { "test_zone".to_string() } else { args.zone.clone() };
+    let forest = ForestMap::fetch(&args.server_url, &zone_id_for_forest).await;
+    zone.set_forest_map(forest);
+    let civic = CivicMap::fetch(&args.server_url, &zone_id_for_forest).await;
+    zone.set_civic_map(civic);
+
+    // Flora — load from cache or generate and save.
+    if let Some(cached) = load_flora_cache(&zone_id_for_forest) {
+        zone.load_cached_flora(cached, now_ms);
+    } else {
+        let flora = zone.spawn_initial_flora(now_ms);
+        save_flora_cache(&zone_id_for_forest, &flora);
+    }
 
     let tick_duration = Duration::from_secs_f64(1.0 / args.tick_rate as f64);
     let mut last_tick = Instant::now();
@@ -315,7 +371,8 @@ async fn run_offline(args: Config) -> Result<()> {
 
         if elapsed >= tick_duration {
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let delta_seconds = elapsed.as_secs_f64();
+            let max_delta = (tick_duration.as_secs_f64() * 2.0).min(0.25);
+            let delta_seconds = elapsed.as_secs_f64().min(max_delta);
 
             // Periodically re-announce all entities so that late-connecting
             // or restarted game servers can rebuild their entity registry.
@@ -336,7 +393,7 @@ async fn run_offline(args: Config) -> Result<()> {
                         _ => info!("Event: {:?}", event),
                     }
                 }
-                if let Err(e) = bridge.publish_events(events).await {
+                if let Err(e) = bridge.publish_events(&zone.zone_id, events).await {
                     warn!("Failed to publish events: {}", e);
                 }
             }
@@ -348,7 +405,55 @@ async fn run_offline(args: Config) -> Result<()> {
     }
 }
 
-/// Try to load terrain from the server, falling back to procedural generation.
+// ── Tree position cache ───────────────────────────────────────────────────────
+
+fn flora_cache_path(zone_id: &str) -> PathBuf {
+    // v5: initial flora spawns at mature stage instead of seed stage.
+    PathBuf::from(format!("data/{}/flora_v5.json", zone_id))
+}
+
+fn load_flora_cache(zone_id: &str) -> Option<Vec<CachedPlant>> {
+    let path = flora_cache_path(zone_id);
+    if !path.exists() { return None; }
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<Vec<CachedPlant>>(&s) {
+            Ok(v) => {
+                info!("Loaded {} cached flora for zone {} from {}", v.len(), zone_id, path.display());
+                Some(v)
+            }
+            Err(e) => {
+                warn!("Failed to parse flora cache {}: {} — regenerating", path.display(), e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Failed to read flora cache {}: {} — regenerating", path.display(), e);
+            None
+        }
+    }
+}
+
+fn save_flora_cache(zone_id: &str, flora: &[CachedPlant]) {
+    let path = flora_cache_path(zone_id);
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("Failed to create cache dir {}: {}", dir.display(), e);
+            return;
+        }
+    }
+    match serde_json::to_string(flora) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, s) {
+                warn!("Failed to write flora cache {}: {}", path.display(), e);
+            } else {
+                info!("Saved {} flora positions to {}", flora.len(), path.display());
+            }
+        }
+        Err(e) => warn!("Failed to serialize flora cache: {}", e),
+    }
+}
+
+/// Try to load terrain from the server with retries, falling back to procedural generation.
 async fn load_terrain(args: &Config) -> Option<terrain::TerrainGrid> {
     if args.tile == "none" {
         info!("Terrain disabled (--tile none)");
@@ -356,45 +461,100 @@ async fn load_terrain(args: &Config) -> Option<terrain::TerrainGrid> {
     }
 
     let origin = Vector3::new(-args.tile_size / 2.0, 0.0, -args.tile_size / 2.0);
-
-    // Try fetching from server
     let client = terrain_client::TerrainClient::new(&args.server_url);
 
-    let result = if args.tile == "auto" {
-        match client.fetch_manifest().await {
-            Ok(manifest) if !manifest.tiles.is_empty() => {
-                let tile_id = &manifest.tiles[0].id;
-                info!("Auto-selected tile: {}", tile_id);
-                client
-                    .fetch_and_build_grid(tile_id, args.tile_size, origin)
-                    .await
-            }
-            Ok(_) => Err(anyhow::anyhow!("No tiles available on server")),
-            Err(e) => Err(e),
-        }
-    } else {
-        client
-            .fetch_and_build_grid(&args.tile, args.tile_size, origin)
-            .await
-    };
+    // Retry up to 5 times with increasing backoff — the game server's HTTP
+    // endpoint may not be ready yet even though Redis is already accepting
+    // connections.
+    let max_retries = 5;
+    let mut last_err = String::new();
 
-    match result {
-        Ok(grid) => {
-            info!("Terrain loaded from server");
-            Some(grid)
-        }
-        Err(e) => {
-            warn!("Failed to load terrain from server: {}. Generating fallback.", e);
-            Some(terrain_client::generate_fallback_terrain(args.tile_size, origin))
+    for attempt in 1..=max_retries {
+        let result = if args.tile == "auto" {
+            match client.fetch_manifest().await {
+                Ok(manifest) if !manifest.tiles.is_empty() => {
+                    // Prefer a tile whose ID matches the zone being simulated.
+                    let tile_id = manifest.tiles
+                        .iter()
+                        .find(|t| t.id == args.zone)
+                        .or_else(|| manifest.tiles.first())
+                        .map(|t| t.id.clone())
+                        .unwrap();
+                    info!("Auto-selected tile: {} (zone: {})", tile_id, args.zone);
+                    client
+                        .fetch_and_build_grid(&tile_id, args.tile_size, origin)
+                        .await
+                }
+                Ok(_) => Err(anyhow::anyhow!("No tiles available on server")),
+                Err(e) => Err(e),
+            }
+        } else {
+            client
+                .fetch_and_build_grid(&args.tile, args.tile_size, origin)
+                .await
+        };
+
+        match result {
+            Ok(grid) => {
+                info!("Terrain loaded from server (attempt {})", attempt);
+                return Some(grid);
+            }
+            Err(e) => {
+                last_err = format!("{}", e);
+                if attempt < max_retries {
+                    let delay_secs = attempt as u64 * 2; // 2, 4, 6, 8 seconds
+                    warn!(
+                        "Terrain fetch attempt {}/{} failed: {}. Retrying in {}s...",
+                        attempt, max_retries, e, delay_secs
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                }
+            }
         }
     }
+
+    warn!(
+        "Failed to load terrain after {} attempts: {}. Generating fallback.",
+        max_retries, last_err
+    );
+    Some(terrain_client::generate_fallback_terrain(args.tile_size, origin))
+}
+
+/// Compute initial population counts scaled to zone area.
+///
+/// Returns `[(species, males, females), ...]`.  Densities are per km²;
+/// for the 200 m fallback terrain (~0.04 km²) the minimums ensure at
+/// least a small starter population.
+fn density_scaled_populations(zone: &ZoneSimulation) -> Vec<(&'static str, usize, usize)> {
+    let area = zone.zone_area_km2();
+
+    // (species, males/km², females/km², min_males, min_females)
+    let specs: &[(&str, f64, f64, usize, usize)] = &[
+        ("rabbit", 12.0, 18.0,  9, 12),  // ~30 /km²  — common prey
+        ("fox",     2.5,  3.0,  4,  5),  // ~5.5/km²  — solitary predator
+        ("deer",    4.5,  6.5,  6,  9),  // ~11 /km²  — herd herbivore
+        ("wolf",    1.5,  2.0,  3,  4),  // ~3.5/km²  — pack predator
+        ("boar",    2.5,  3.0,  4,  5),  // ~5.5/km²  — omnivore
+    ];
+
+    specs
+        .iter()
+        .map(|&(species, m_den, f_den, min_m, min_f)| {
+            let males   = ((m_den * area).round() as usize).max(min_m);
+            let females = ((f_den * area).round() as usize).max(min_f);
+            (species, males, females)
+        })
+        .collect()
 }
 
 async fn handle_game_message(
     zones: &mut HashMap<String, ZoneSimulation>,
     msg: GameServerMessage,
     redis_url: &str,
+    server_url: &str,
     terrain: &Option<terrain::TerrainGrid>,
+    time_scale: f64,
+    flora: &FloraConfig,
 ) {
     match msg {
         GameServerMessage::ZoneInfo { zone } => {
@@ -408,6 +568,8 @@ async fn handle_game_message(
                 existing.re_announce_all();
             } else {
                 let mut sim = ZoneSimulation::new(zone.id.clone(), zone.biome, zone.bounds_min, zone.bounds_max);
+                sim.set_time_scale(time_scale);
+                sim.set_flora_config(flora);
 
                 if let Err(e) = sim.init_climate(redis_url).await {
                     warn!("Failed to initialize climate for zone {}: {}", zone.id, e);
@@ -423,24 +585,38 @@ async fn handle_game_message(
                     sim.set_terrain(t.clone());
                 }
 
-                // Spawn initial populations for the new zone
+                // Load forest polygons so trees spawn inside OSM wood/forest areas
+                let forest = ForestMap::fetch(server_url, &zone.id).await;
+                sim.set_forest_map(forest);
+                let civic = CivicMap::fetch(server_url, &zone.id).await;
+                sim.set_civic_map(civic);
+
+                // Spawn initial populations (density-scaled to zone area)
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let rabbits = sim.spawn_population("rabbit", 3, 7, now_ms);
-                let foxes = sim.spawn_population("fox", 2, 4, now_ms);
-                let deer = sim.spawn_population("deer", 2, 5, now_ms);
-                let wolves = sim.spawn_population("wolf", 1, 3, now_ms);
-                let boars = sim.spawn_population("boar", 2, 4, now_ms);
-                info!(
-                    "Zone {}: spawned {} rabbits, {} foxes, {} deer, {} wolves, {} boars",
-                    zone.id, rabbits, foxes, deer, wolves, boars
-                );
-                sim.spawn_initial_plants(now_ms);
+                info!("Zone {}: area {:.2} km² — scaling populations", zone.id, sim.zone_area_km2());
+                for (species, males, females) in density_scaled_populations(&sim) {
+                    let count = sim.spawn_population(species, males, females, now_ms);
+                    info!("  Zone {}: spawned {} {} ({}M + {}F)", zone.id, count, species, males, females);
+                }
+                // Flora — load from cache or generate and save.
+                if let Some(cached) = load_flora_cache(&zone.id) {
+                    sim.load_cached_flora(cached, now_ms);
+                } else {
+                    let flora = sim.spawn_initial_flora(now_ms);
+                    save_flora_cache(&zone.id, &flora);
+                }
 
                 zones.insert(zone.id, sim);
             }
         }
 
         GameServerMessage::PlayersUpdate { players } => {
+            // Clear ALL zones first so that zones whose players left are
+            // correctly emptied (prevents animals fleeing from stale positions).
+            for zone in zones.values_mut() {
+                zone.update_players(Vec::new());
+            }
+
             // Group players by zone
             let mut by_zone: HashMap<String, Vec<PlayerPosition>> = HashMap::new();
             for player in players {

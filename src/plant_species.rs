@@ -16,6 +16,7 @@ pub enum PlantType {
     Vegetable,
     Herb,
     FruitTree,
+    Tree,
 }
 
 /// Configuration for a growth stage
@@ -81,6 +82,9 @@ pub static PLANT_SPECIES: LazyLock<HashMap<&'static str, PlantSpecies>> = LazyLo
     map.insert("herb_sage",   herb_sage());
     map.insert("mushroom",    mushroom());
     map.insert("berry_bush",  berry_bush());
+    map.insert("pine_tree",   pine_tree());
+    map.insert("oak_tree",    oak_tree());
+    map.insert("maple_tree",  maple_tree());
 
     map
 });
@@ -578,5 +582,100 @@ fn berry_bush() -> PlantSpecies {
 
         preferred_biomes: vec![BiomeType::Forest, BiomeType::Grassland, BiomeType::Coastal],
         spawn_weight: 3.5,
+    }
+}
+
+fn pine_tree() -> PlantSpecies {
+    PlantSpecies {
+        id: "pine_tree",
+        name: "Pine Tree",
+        plant_type: PlantType::Tree,
+
+        // Very long growth time — environment trees are effectively permanent.
+        // Single Mature stage means they always spawn fully grown.
+        total_growth_time: 86400.0,
+        growth_stages: vec![
+            GrowthStageConfig {
+                stage: PlantGrowthStage::Mature,
+                duration_ratio: 1.0,
+                can_be_eaten: false,
+                can_be_harvested: true,
+                food_value: 0.0,
+            },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall, Season::Winter],
+        harvest_seasons: vec![],
+        dormant_in_winter: false,
+
+        harvest_item: "log",
+        harvest_yield: (3, 6),
+        regrows_after_harvest: false,
+        regrow_stage: PlantGrowthStage::Dead,
+
+        preferred_biomes: vec![BiomeType::Forest, BiomeType::Mountain, BiomeType::Tundra],
+        spawn_weight: 8.0,
+    }
+}
+
+fn oak_tree() -> PlantSpecies {
+    PlantSpecies {
+        id: "oak_tree",
+        name: "Oak Tree",
+        plant_type: PlantType::Tree,
+
+        total_growth_time: 86400.0,
+        growth_stages: vec![
+            GrowthStageConfig {
+                stage: PlantGrowthStage::Mature,
+                duration_ratio: 1.0,
+                can_be_eaten: false,
+                can_be_harvested: true,
+                food_value: 0.0,
+            },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall, Season::Winter],
+        harvest_seasons: vec![],
+        dormant_in_winter: false,
+
+        harvest_item: "log",
+        harvest_yield: (4, 8),
+        regrows_after_harvest: false,
+        regrow_stage: PlantGrowthStage::Dead,
+
+        preferred_biomes: vec![BiomeType::Forest, BiomeType::Grassland],
+        spawn_weight: 6.0,
+    }
+}
+
+fn maple_tree() -> PlantSpecies {
+    PlantSpecies {
+        id: "maple_tree",
+        name: "Maple Tree",
+        plant_type: PlantType::Tree,
+
+        total_growth_time: 86400.0,
+        growth_stages: vec![
+            GrowthStageConfig {
+                stage: PlantGrowthStage::Mature,
+                duration_ratio: 1.0,
+                can_be_eaten: false,
+                can_be_harvested: true,
+                food_value: 0.0,
+            },
+        ],
+
+        growing_seasons: vec![Season::Spring, Season::Summer, Season::Fall, Season::Winter],
+        harvest_seasons: vec![],
+        dormant_in_winter: false,
+
+        harvest_item: "log",
+        harvest_yield: (3, 7),
+        regrows_after_harvest: false,
+        regrow_stage: PlantGrowthStage::Dead,
+
+        preferred_biomes: vec![BiomeType::Forest, BiomeType::Coastal],
+        spawn_weight: 5.0,
     }
 }

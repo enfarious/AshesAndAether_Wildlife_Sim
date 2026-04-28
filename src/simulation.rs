@@ -3,7 +3,10 @@
 //! Core simulation loop for wildlife and flora
 
 use crate::behavior::*;
+use crate::climate::Climate;
 use crate::climate_subscriber::{ClimateCache, ClimateSnapshot, Season};
+use crate::civic_map::CivicMap;
+use crate::forest_map::ForestMap;
 use crate::pathfinding;
 use crate::plant_species::{get_plant_species, PlantType};
 use crate::species::get_species;
@@ -11,10 +14,49 @@ use crate::terrain::{TerrainBiome, TerrainGrid};
 use crate::types::*;
 use crate::weather_subscriber::{WeatherCache, WeatherEventType, WeatherSnapshot};
 use rand::Rng;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
 
+/// Range in metres within which an entity gets full per-tick simulation.
+/// Entities farther than this from every player simulate at a lower rate
+/// (~1 Hz instead of 10 Hz) — they still update needs and age, but they don't
+/// re-decide behaviour, repath, or move every tick.  Cuts ~90 % of work in
+/// typical scenarios where one player can only "see" a few hundred animals.
+const ACTIVE_RANGE: f64 = 300.0;
+const ACTIVE_RANGE_SQ: f64 = ACTIVE_RANGE * ACTIVE_RANGE;
+
+/// Cell side length for the wildlife spatial grid.  Most species have sight
+/// ranges of 50–150 m, so a 100 m cell means perception queries scan a 3×3
+/// block of cells.  At 1500 entities in ~36 km² that's ~4 entities per query
+/// instead of all 1500 — turns the O(N²) perception scan into ~O(N).
+const SPATIAL_CELL_SIZE: f64 = 100.0;
+
+/// A pending pathfinding request.  update_wildlife_entity enqueues these;
+/// update() drains them at the end of the tick and runs the A* searches in
+/// parallel via rayon.  Paths arrive one tick late (entities use any existing
+/// path or fall back to heading-based movement until then).
+#[derive(Debug, Clone)]
+struct PathRequest {
+    entity_id:        String,
+    from:             Vector3,
+    to:               Vector3,
+    requested_at_ms:  i64,
+}
+
 const ELDER_AGE_MULTIPLIER: f64 = 3.0;
+
+/// A single entry in the on-disk flora position cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPlant {
+    pub species: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    #[serde(default)]
+    pub variant: u8,
+}
 const LEVEL_HEALTH_BONUS: f64 = 0.08;
 const LEVEL_DAMAGE_BONUS: f64 = 0.05;
 
@@ -63,13 +105,19 @@ pub struct ZoneSimulation {
     // Terrain data (from server or procedural fallback)
     pub terrain: Option<TerrainGrid>,
 
-    // Climate system (subscribed from climate_sim via Redis)
+    // Climate system — external (Redis) with internal fallback
     pub climate_cache: Option<ClimateCache>,
     pub current_climate: Option<ClimateSnapshot>,
+    /// Internal clock used when the external climate_sim is not running.
+    internal_climate: Climate,
+    /// Tracks whether we logged the external→internal transition (avoid log spam).
+    using_external_climate: bool,
 
-    // Weather system (subscribed from weather_sim via Redis)
+    // Weather system — external (Redis) with calm fallback
     pub weather_cache: Option<WeatherCache>,
     pub current_weather: Option<WeatherSnapshot>,
+    /// Tracks whether we logged the external→internal transition.
+    using_external_weather: bool,
 
     // Entities
     pub wildlife: HashMap<String, WildlifeEntity>,
@@ -81,6 +129,18 @@ pub struct ZoneSimulation {
     // External state (from game server)
     pub player_positions: Vec<PlayerPosition>,
 
+    // Forest polygons — restricts tree spawning to OSM wood/forest areas
+    pub forest_map: ForestMap,
+    // Civic anchor positions — keeps trees clear of beacons/civic buildings
+    pub civic_map: CivicMap,
+
+    // Clearance distances for tree spawning (metres from cell edge)
+    tree_structure_clearance: f64,
+    tree_road_clearance: f64,
+    tree_water_clearance: f64,
+    tree_zone_multiplier: f64,
+    tree_forest_multiplier: f64,
+
     // Water sources (fallback when no terrain)
     pub water_sources: Vec<Vector3>,
 
@@ -88,6 +148,7 @@ pub struct ZoneSimulation {
     last_update_ms: i64,
     last_spawn_check_ms: i64,
     last_plant_spawn_ms: i64,
+    last_plant_update_ms: i64,
     last_status_log_ms: i64,
 
     // ID generation
@@ -96,6 +157,19 @@ pub struct ZoneSimulation {
 
     // Pending events to send
     pub pending_events: Vec<WildlifeEvent>,
+
+    // Pathfinding requests collected during the current tick — drained and
+    // processed in parallel at end-of-tick.
+    pending_path_requests: Vec<PathRequest>,
+
+    // Spatial index for live wildlife — rebuilt at the start of every tick.
+    // Maps cell (x, z) coordinates to entity IDs.
+    spatial_grid: HashMap<(i32, i32), Vec<String>>,
+
+    // Spatial index for plants.  Plants rarely change so we mark this dirty
+    // when plants are added/removed/eaten and only rebuild when needed.
+    plant_grid: HashMap<(i32, i32), Vec<String>>,
+    plant_grid_dirty: bool,
 }
 
 impl ZoneSimulation {
@@ -108,23 +182,126 @@ impl ZoneSimulation {
             terrain: None,
             climate_cache: None,
             current_climate: None,
+            internal_climate: Climate::default(),
+            using_external_climate: false,
             weather_cache: None,
             current_weather: None,
+            using_external_weather: false,
 
             wildlife: HashMap::new(),
             plants: HashMap::new(),
             entity_paths: HashMap::new(),
             player_positions: Vec::new(),
+            forest_map: ForestMap::empty(),
+            civic_map: CivicMap::empty(),
+            tree_structure_clearance: 20.0,
+            tree_road_clearance: 10.0,
+            tree_water_clearance: 5.0,
+            tree_zone_multiplier: 3.0,
+            tree_forest_multiplier: 10.0,
             water_sources: Vec::new(),
 
             last_update_ms: 0,
             last_spawn_check_ms: 0,
             last_plant_spawn_ms: 0,
+            last_plant_update_ms: 0,
             last_status_log_ms: 0,
             next_entity_id: 1,
             next_plant_id: 1,
             pending_events: Vec::new(),
+            pending_path_requests: Vec::new(),
+            spatial_grid: HashMap::new(),
+            plant_grid: HashMap::new(),
+            plant_grid_dirty: true,
         }
+    }
+
+    /// Rebuild the plant spatial grid.  Only includes edible plants —
+    /// trees (pine/oak/maple) make up ~95 % of plants but no animal eats
+    /// them, so excluding them shrinks the grid 20× and makes herbivore
+    /// food perception nearly free.
+    fn rebuild_plant_grid(&mut self) {
+        self.plant_grid.clear();
+        for (id, plant) in &self.plants {
+            if !plant.is_alive { continue; }
+            let species = match get_plant_species(&plant.species_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Skip large trees — herbivores don't forage them
+            if matches!(species.plant_type, PlantType::Tree) { continue; }
+            let cx = (plant.position.x / SPATIAL_CELL_SIZE).floor() as i32;
+            let cz = (plant.position.z / SPATIAL_CELL_SIZE).floor() as i32;
+            self.plant_grid.entry((cx, cz)).or_default().push(id.clone());
+        }
+        self.plant_grid_dirty = false;
+    }
+
+    fn plant_spatial_query<F: FnMut(&str)>(&self, pos: Vector3, range: f64, mut f: F) {
+        let cx = (pos.x / SPATIAL_CELL_SIZE).floor() as i32;
+        let cz = (pos.z / SPATIAL_CELL_SIZE).floor() as i32;
+        let r  = (range / SPATIAL_CELL_SIZE).ceil() as i32;
+        for dx in -r..=r {
+            for dz in -r..=r {
+                if let Some(ids) = self.plant_grid.get(&(cx + dx, cz + dz)) {
+                    for id in ids { f(id); }
+                }
+            }
+        }
+    }
+
+    /// Rebuild the spatial grid from current wildlife positions.  Called once
+    /// per tick before the entity update loop so build_context() can do
+    /// neighbour queries in near-constant time.
+    fn rebuild_spatial_grid(&mut self) {
+        self.spatial_grid.clear();
+        for (id, entity) in &self.wildlife {
+            if !entity.is_alive { continue; }
+            let cx = (entity.position.x / SPATIAL_CELL_SIZE).floor() as i32;
+            let cz = (entity.position.z / SPATIAL_CELL_SIZE).floor() as i32;
+            self.spatial_grid.entry((cx, cz)).or_default().push(id.clone());
+        }
+    }
+
+    /// Iterate all wildlife IDs in cells overlapping a circle of `range`
+    /// metres around `pos`.  Caller must still distance-check returned IDs
+    /// since cell coverage is rectangular and approximate.
+    fn spatial_query<F: FnMut(&str)>(&self, pos: Vector3, range: f64, mut f: F) {
+        let cx = (pos.x / SPATIAL_CELL_SIZE).floor() as i32;
+        let cz = (pos.z / SPATIAL_CELL_SIZE).floor() as i32;
+        let r  = (range / SPATIAL_CELL_SIZE).ceil() as i32;
+        for dx in -r..=r {
+            for dz in -r..=r {
+                if let Some(ids) = self.spatial_grid.get(&(cx + dx, cz + dz)) {
+                    for id in ids { f(id); }
+                }
+            }
+        }
+    }
+
+    /// Zone area in km².  Used to scale population densities.
+    pub fn zone_area_km2(&self) -> f64 {
+        let width = (self.bounds_max.x - self.bounds_min.x).abs();
+        let depth = (self.bounds_max.z - self.bounds_min.z).abs();
+        (width * depth) / 1_000_000.0
+    }
+
+    pub fn set_civic_map(&mut self, map: CivicMap) {
+        self.civic_map = map;
+    }
+
+    /// Set forest polygon map for ecologically accurate tree placement.
+    pub fn set_forest_map(&mut self, map: ForestMap) {
+        self.forest_map = map;
+    }
+
+    /// Configure how far trees must be from building footprints and roads.
+    pub fn set_flora_config(&mut self, cfg: &crate::FloraConfig) {
+        self.tree_structure_clearance = cfg.tree_building_clearance;
+        self.tree_road_clearance      = cfg.tree_road_clearance;
+        self.tree_water_clearance     = cfg.tree_water_clearance;
+        self.tree_zone_multiplier     = cfg.zone_tree_multiplier;
+        self.tree_forest_multiplier   = cfg.forest_tree_multiplier;
     }
 
     /// Set terrain data and update bounds to match.
@@ -143,59 +320,262 @@ impl ZoneSimulation {
             .unwrap_or(12.0)
     }
 
-    /// Initialize climate subscription (call once at startup)
+    /// Initialize climate subscription (call once at startup).
+    /// Subscribes to the external climate_sim via Redis. If external data
+    /// arrives, it takes priority. Otherwise the internal Climate clock
+    /// drives climate state as a fallback.
     pub async fn init_climate(&mut self, redis_url: &str) -> anyhow::Result<()> {
         let cache = ClimateCache::new(self.zone_id.clone());
         cache.start_subscription(redis_url).await?;
-        
-        // Wait for first climate update (max 5 seconds)
+
+        // Wait briefly for external data (max 5 seconds)
         self.current_climate = cache.get_or_wait(5000).await;
+
+        if let Some(ref snapshot) = self.current_climate {
+            // Sync internal clock to match external sim's time
+            self.internal_climate.day_of_year = snapshot.day_of_year;
+            self.internal_climate.time_of_day = snapshot.time_of_day;
+            self.internal_climate.year = snapshot.year;
+            self.using_external_climate = true;
+            info!(
+                zone = %self.zone_id,
+                "Using external climate_sim (Day {} {:?})",
+                snapshot.day_of_year, snapshot.season
+            );
+        } else {
+            // No external data — start with internal fallback immediately
+            self.current_climate = Some(self.internal_climate.to_snapshot(&self.zone_id));
+            info!(
+                zone = %self.zone_id,
+                "No external climate_sim detected — using internal fallback"
+            );
+        }
+
         self.climate_cache = Some(cache);
-        
         Ok(())
     }
 
-    /// Initialize weather subscription (call once at startup)
+    /// Initialize weather subscription (call once at startup).
+    /// Subscribes to the external weather_sim via Redis. Falls back to
+    /// calm weather if no external data is available.
     pub async fn init_weather(&mut self, redis_url: &str) -> anyhow::Result<()> {
         let mut cache = WeatherCache::new(self.zone_id.clone());
         cache.start_subscription(redis_url).await?;
         self.current_weather = cache.get().await;
+
+        if self.current_weather.is_some() {
+            self.using_external_weather = true;
+            info!(zone = %self.zone_id, "Using external weather_sim");
+        } else {
+            info!(zone = %self.zone_id, "No external weather_sim detected — using calm weather fallback");
+        }
+
         self.weather_cache = Some(cache);
         Ok(())
+    }
+
+    /// Set the time scale for the internal fallback climate clock.
+    pub fn set_time_scale(&mut self, time_scale: f64) {
+        self.internal_climate.time_scale = time_scale;
     }
 
     /// Main update tick
     pub async fn update(&mut self, now_ms: i64, delta_seconds: f64) {
         let mut rng = rand::thread_rng();
 
-        // Get latest climate from cache (non-blocking)
-        if let Some(ref cache) = self.climate_cache {
-            if let Some(snapshot) = cache.get().await {
-                self.current_climate = Some(snapshot);
+        // ── Climate: prefer external, fall back to internal ──────────
+        let external_climate_active = self.climate_cache
+            .as_ref()
+            .map(|c| c.is_external_active())
+            .unwrap_or(false);
+
+        if external_climate_active {
+            // External climate_sim is running — use its data
+            if let Some(ref cache) = self.climate_cache {
+                if let Some(snapshot) = cache.get().await {
+                    // Sync internal clock to stay in step (for seamless handoff)
+                    self.internal_climate.day_of_year = snapshot.day_of_year;
+                    self.internal_climate.time_of_day = snapshot.time_of_day;
+                    self.internal_climate.year = snapshot.year;
+                    self.current_climate = Some(snapshot);
+                }
+            }
+            if !self.using_external_climate {
+                info!(zone = %self.zone_id, "External climate_sim detected — switching from internal fallback");
+                self.using_external_climate = true;
+            }
+        } else {
+            // No external data (or stale) — drive climate internally
+            self.internal_climate.advance(delta_seconds);
+            self.current_climate = Some(self.internal_climate.to_snapshot(&self.zone_id));
+            if self.using_external_climate {
+                info!(zone = %self.zone_id, "External climate_sim went away — switching to internal fallback");
+                self.using_external_climate = false;
             }
         }
 
-        // Get latest weather from cache (non-blocking)
-        if let Some(ref cache) = self.weather_cache {
-            if let Some(snapshot) = cache.get().await {
-                self.current_weather = Some(snapshot);
+        // ── Weather: prefer external, fall back to calm ──────────────
+        let external_weather_active = self.weather_cache
+            .as_ref()
+            .map(|c| c.is_external_active())
+            .unwrap_or(false);
+
+        if external_weather_active {
+            if let Some(ref cache) = self.weather_cache {
+                if let Some(snapshot) = cache.get().await {
+                    self.current_weather = Some(snapshot);
+                }
+            }
+            if !self.using_external_weather {
+                info!(zone = %self.zone_id, "External weather_sim detected — using external weather");
+                self.using_external_weather = true;
+            }
+        } else {
+            // No external weather — use calm defaults
+            self.current_weather = Some(WeatherSnapshot {
+                zone_id: self.zone_id.clone(),
+                timestamp_ms: now_ms,
+                active_events: Vec::new(),
+                base_wind_speed: 2.0,
+                base_wind_direction: 0.0,
+                precipitation: 0.0,
+                cloud_cover: 0.3,
+                visibility: 1000.0,
+            });
+            if self.using_external_weather {
+                info!(zone = %self.zone_id, "External weather_sim went away — using calm weather fallback");
+                self.using_external_weather = false;
             }
         }
 
-        // Update all wildlife
+        // ── PROFILE TIMERS ──
+        let _t_start = std::time::Instant::now();
+        let _t_grid_start = std::time::Instant::now();
+
+        // Build the spatial index used by perception queries this tick.
+        self.rebuild_spatial_grid();
+        if self.plant_grid_dirty {
+            self.rebuild_plant_grid();
+        }
+        let t_grid_ms = _t_grid_start.elapsed().as_millis();
+
+        let _t_wildlife_start = std::time::Instant::now();
+        let mut near_count = 0;
+        let mut coarse_count = 0;
+
+        // AI LOD: full per-tick simulation only for entities near a player;
+        // distant entities update at ~1 Hz to keep needs/aging consistent
+        // without burning CPU on animals nobody can see.
         let entity_ids: Vec<String> = self.wildlife.keys().cloned().collect();
         for id in entity_ids {
-            self.update_wildlife_entity(&id, now_ms, delta_seconds, &mut rng);
-        }
+            let (entity_pos, last_tick) = match self.wildlife.get(&id) {
+                Some(e) if e.is_alive => (e.position, e.last_update_tick_ms),
+                _ => continue,
+            };
 
-        // Update all plants
-        let plant_ids: Vec<String> = self.plants.keys().cloned().collect();
-        for id in plant_ids {
-            self.update_plant(&id, delta_seconds);
+            let near_player = self.player_positions.iter().any(|p| {
+                let dx = entity_pos.x - p.position.x;
+                let dz = entity_pos.z - p.position.z;
+                dx * dx + dz * dz <= ACTIVE_RANGE_SQ
+            });
+
+            if near_player {
+                near_count += 1;
+                if let Some(e) = self.wildlife.get_mut(&id) {
+                    e.last_update_tick_ms = now_ms;
+                }
+                self.update_wildlife_entity(&id, now_ms, delta_seconds, &mut rng);
+            } else if now_ms - last_tick >= 1_000 {
+                coarse_count += 1;
+                // Far from players — coarse update.  Cap dt at the same value
+                // the outer tick uses so a slow tick (or first-ever update
+                // with last_tick == 0 against now_ms in the billions) can't
+                // pass a giant dt that makes movement code request a path
+                // hundreds of metres away.  Far entities effectively run in
+                // mild slow-motion, which nobody can see.
+                let coarse_dt = if last_tick == 0 {
+                    delta_seconds
+                } else {
+                    let raw = (now_ms - last_tick) as f64 / 1000.0;
+                    raw.min(delta_seconds.max(0.25))
+                };
+                if let Some(e) = self.wildlife.get_mut(&id) {
+                    e.last_update_tick_ms = now_ms;
+                }
+                self.update_wildlife_entity(&id, now_ms, coarse_dt, &mut rng);
+            }
         }
+        let t_wildlife_ms = _t_wildlife_start.elapsed().as_millis();
+        let path_request_count = self.pending_path_requests.len();
+        let _t_paths_start = std::time::Instant::now();
+
+        // ── Parallel pathfinding ──
+        // update_wildlife_entity above only collects PathRequests; the actual
+        // A* searches happen here, in parallel across rayon's thread pool.
+        // For ~1500 entities this drops pathfinding from ~600 ms/tick (single
+        // core) to under 100 ms on a typical 4–8 core CPU.
+        if !self.pending_path_requests.is_empty() {
+            if let Some(ref terrain) = self.terrain {
+                let requests = std::mem::take(&mut self.pending_path_requests);
+                let new_paths: Vec<(String, Option<EntityPath>)> = requests
+                    .par_iter()
+                    .map(|req| {
+                        let path = pathfinding::find_path(terrain, req.from, req.to)
+                            .filter(|wpts| !wpts.is_empty())
+                            .map(|waypoints| EntityPath {
+                                waypoints,
+                                current_index:  0,
+                                target:         req.to,
+                                computed_at_ms: req.requested_at_ms,
+                            });
+                        (req.entity_id.clone(), path)
+                    })
+                    .collect();
+                for (id, path) in new_paths {
+                    match path {
+                        Some(p) => { self.entity_paths.insert(id, p); }
+                        None    => { self.entity_paths.remove(&id); }
+                    }
+                }
+            } else {
+                self.pending_path_requests.clear();
+            }
+        }
+        let t_paths_ms = _t_paths_start.elapsed().as_millis();
+        let _t_plants_start = std::time::Instant::now();
+        let mut did_plants = false;
+
+        // Update plants at most once per second — stage transitions take hours,
+        // so 10 Hz updates burn ~1 sec/tick on 100k+ plants for no visible gain.
+        // Pass the real elapsed time so growth math stays correct.
+        if now_ms - self.last_plant_update_ms >= 1000 {
+            let plant_dt = if self.last_plant_update_ms == 0 {
+                delta_seconds
+            } else {
+                (now_ms - self.last_plant_update_ms) as f64 / 1000.0
+            };
+            self.last_plant_update_ms = now_ms;
+            did_plants = true;
+
+            let plant_ids: Vec<String> = self.plants.keys().cloned().collect();
+            for id in plant_ids {
+                self.update_plant(&id, plant_dt);
+            }
+        }
+        let t_plants_ms = _t_plants_start.elapsed().as_millis();
+        let _t_hunt_start = std::time::Instant::now();
 
         // Process attacks and interactions
         self.process_hunting(now_ms);
+        let t_hunt_ms = _t_hunt_start.elapsed().as_millis();
+        let total_ms = _t_start.elapsed().as_millis();
+        if total_ms > 200 {
+            tracing::warn!(
+                "PROFILE total={} grid={} wildlife={} (near={} coarse={}) paths={} (n={}) plants={} (ran={}) hunt={}",
+                total_ms, t_grid_ms, t_wildlife_ms, near_count, coarse_count,
+                t_paths_ms, path_request_count, t_plants_ms, did_plants, t_hunt_ms,
+            );
+        }
 
         // Check wildlife spawns periodically (every 30 seconds)
         if now_ms - self.last_spawn_check_ms > 30_000 {
@@ -318,7 +698,7 @@ impl ZoneSimulation {
 
         lines.push("─────────────────────────────────────────────────".to_string());
 
-        info!("\n{}", lines.join("\n"));
+        println!("\n{}", lines.join("\n"));
     }
 
     fn update_wildlife_entity(
@@ -328,6 +708,7 @@ impl ZoneSimulation {
         delta_seconds: f64,
         rng: &mut impl Rng,
     ) {
+        let _t_entity_start = std::time::Instant::now();
         // First, gather immutable data we need
         let (species_id, is_alive, should_check_birth) = {
             let entity = match self.wildlife.get(entity_id) {
@@ -419,11 +800,52 @@ impl ZoneSimulation {
             return;
         }
 
+        let _t_pre_perc = _t_entity_start.elapsed().as_micros();
+
+        // Refresh perception caches if stale and the entity might actually
+        // care.  Each terrain.nearest_* call scans thousands of cells; doing
+        // it every tick for every entity was the dominant remaining cost.
+        // Thirsty/tired animals need fresh data; sated ones don't.
+        {
+            let (pos, needs_water_check, needs_shelter_check) = {
+                let entity = self.wildlife.get(entity_id).unwrap();
+                let water_stale   = now_ms - entity.cached_water_at_ms   > 3_000;
+                let shelter_stale = now_ms - entity.cached_shelter_at_ms > 3_000;
+                let need_water   = entity.needs.thirst < 70.0;
+                let need_shelter = matches!(
+                    entity.current_behavior,
+                    BehaviorState::Fleeing | BehaviorState::Resting,
+                ) || entity.needs.energy < 40.0;
+                (entity.position,
+                 water_stale   && need_water,
+                 shelter_stale && need_shelter)
+            };
+            if needs_water_check {
+                let water = self.terrain.as_ref()
+                    .and_then(|t| t.nearest_water(pos.x, pos.z, species.smell_range));
+                if let Some(e) = self.wildlife.get_mut(entity_id) {
+                    e.cached_water = water;
+                    e.cached_water_at_ms = now_ms;
+                }
+            }
+            if needs_shelter_check {
+                let shelter = self.terrain.as_ref()
+                    .and_then(|t| t.nearest_shelter(pos.x, pos.z, species.sight_range));
+                if let Some(e) = self.wildlife.get_mut(entity_id) {
+                    e.cached_shelter = shelter;
+                    e.cached_shelter_at_ms = now_ms;
+                }
+            }
+        }
+
+        let _t_perc_done = _t_entity_start.elapsed().as_micros();
+
         // Build environment context (needs immutable borrow of self)
         let context = {
             let entity = self.wildlife.get(entity_id).unwrap();
             self.build_context(entity, species)
         };
+        let _t_ctx_done = _t_entity_start.elapsed().as_micros();
 
         // Select behavior
         let decision = {
@@ -450,13 +872,22 @@ impl ZoneSimulation {
                 // Determine movement target
                 let move_target = match (&decision.target_position, decision.behavior) {
                     (Some(threat), BehaviorState::Fleeing) => {
+                        // Flee distance scales with species sight range — a deer that
+                        // detects a threat at 120 m should run far, not just 30 m.
+                        let _threat_dist = entity_pos.distance_2d(threat);
+                        let flee_dist = (species.sight_range * 1.5)
+                            .max(80.0)   // At minimum bolt 80 m
+                            .min(300.0); // Cap to avoid pathing across the whole map
+
                         // Prey/hybrid prefers fleeing toward nearby cover/shelter
                         let mut flee_point = None;
 
                         if species.diet_type == DietType::Prey
                             || species.diet_type == DietType::Hybrid
                         {
-                            if let Some(shelter) = terrain.nearest_shelter(entity_pos.x, entity_pos.z, 40.0) {
+                            // Search for shelter within the flee distance
+                            let shelter_range = flee_dist.min(120.0);
+                            if let Some(shelter) = terrain.nearest_shelter(entity_pos.x, entity_pos.z, shelter_range) {
                                 // Only use shelter if it's roughly in the flee direction
                                 let to_shelter_x = shelter.x - entity_pos.x;
                                 let to_shelter_z = shelter.z - entity_pos.z;
@@ -474,7 +905,6 @@ impl ZoneSimulation {
                             let dx = entity_pos.x - threat.x;
                             let dz = entity_pos.z - threat.z;
                             let dist = (dx * dx + dz * dz).sqrt().max(0.01);
-                            let flee_dist = 30.0;
                             let (bmin, bmax) = terrain.world_bounds();
                             let fx = (entity_pos.x + (dx / dist) * flee_dist).clamp(bmin.x + 1.0, bmax.x - 1.0);
                             let fz = (entity_pos.z + (dz / dist) * flee_dist).clamp(bmin.z + 1.0, bmax.z - 1.0);
@@ -486,61 +916,80 @@ impl ZoneSimulation {
                     }
                     (Some(target), _) => Some(*target),
                     (None, _) => {
-                        // Wandering: pick a random walkable nearby point
-                        let wander_dist = 15.0 + rng.gen_range(0.0..15.0);
-                        let mut target = None;
-                        for _ in 0..5 {
-                            let angle: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
-                            let wx = entity_pos.x + angle.sin() * wander_dist;
-                            let wz = entity_pos.z + angle.cos() * wander_dist;
-                            if terrain.is_walkable(wx, wz) {
-                                let wy = terrain.get_elevation(wx, wz) as f64;
-                                target = Some(Vector3::new(wx, wy, wz));
-                                break;
+                        // Wandering: reuse existing wander target if still valid
+                        let existing = entity.wander_target;
+                        let existing_age_ms = now_ms - entity.wander_target_set_at;
+                        let reuse = existing.is_some()
+                            && existing_age_ms < 8000
+                            && existing.unwrap().distance_2d(&entity_pos) > 3.0;
+
+                        if reuse {
+                            existing
+                        } else {
+                            // Generate a new random walkable point
+                            let wander_dist = 15.0 + rng.gen_range(0.0..15.0);
+                            let mut target = None;
+                            for _ in 0..5 {
+                                let angle: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+                                let wx = entity_pos.x + angle.sin() * wander_dist;
+                                let wz = entity_pos.z + angle.cos() * wander_dist;
+                                if terrain.is_walkable(wx, wz) {
+                                    let wy = terrain.get_elevation(wx, wz) as f64;
+                                    target = Some(Vector3::new(wx, wy, wz));
+                                    break;
+                                }
                             }
-                        }
-                        // If nothing walkable found, wander based on heading
-                        if target.is_none() {
-                            let rad = entity_heading.to_radians();
-                            let wx = entity_pos.x + rad.sin() * wander_dist;
-                            let wz = entity_pos.z + rad.cos() * wander_dist;
-                            if terrain.is_walkable(wx, wz) {
-                                let wy = terrain.get_elevation(wx, wz) as f64;
-                                target = Some(Vector3::new(wx, wy, wz));
+                            // If nothing walkable found, wander based on heading
+                            if target.is_none() {
+                                let rad = entity_heading.to_radians();
+                                let wx = entity_pos.x + rad.sin() * wander_dist;
+                                let wz = entity_pos.z + rad.cos() * wander_dist;
+                                if terrain.is_walkable(wx, wz) {
+                                    let wy = terrain.get_elevation(wx, wz) as f64;
+                                    target = Some(Vector3::new(wx, wy, wz));
+                                }
                             }
+                            // Persist the new wander target on the entity
+                            if let Some(t) = target {
+                                if let Some(e) = self.wildlife.get_mut(entity_id) {
+                                    e.wander_target = Some(t);
+                                    e.wander_target_set_at = now_ms;
+                                }
+                            }
+                            target
                         }
-                        target
                     }
                 };
 
                 if let Some(target) = move_target {
-                    // Check if we need a new path
+                    // Check if we need a new path — tolerances scale by behavior
+                    let is_urgent = matches!(
+                        decision.behavior,
+                        BehaviorState::Hunting | BehaviorState::Fleeing
+                            | BehaviorState::Stalking | BehaviorState::SeekingMate
+                    );
+                    let target_move_tolerance = if is_urgent { 5.0 } else { 20.0 };
+                    let stale_ms = if is_urgent { 2000 } else { 10000 };
+
                     let needs_new_path = match self.entity_paths.get(entity_id) {
                         None => true,
                         Some(p) => {
                             p.current_index >= p.waypoints.len()
-                                || target.distance_2d(&p.target) > 5.0
-                                || now_ms - p.computed_at_ms > 2000
+                                || target.distance_2d(&p.target) > target_move_tolerance
+                                || now_ms - p.computed_at_ms > stale_ms
                         }
                     };
 
                     if needs_new_path {
-                        match pathfinding::find_path(terrain, entity_pos, target) {
-                            Some(waypoints) if !waypoints.is_empty() => {
-                                self.entity_paths.insert(
-                                    entity_id.to_string(),
-                                    EntityPath {
-                                        waypoints,
-                                        current_index: 0,
-                                        target,
-                                        computed_at_ms: now_ms,
-                                    },
-                                );
-                            }
-                            _ => {
-                                self.entity_paths.remove(entity_id);
-                            }
-                        }
+                        // Defer A* — collected and run in parallel at end of tick.
+                        // Entity uses existing (possibly stale) path this tick or
+                        // falls back to heading-based movement if no path exists.
+                        self.pending_path_requests.push(PathRequest {
+                            entity_id:       entity_id.to_string(),
+                            from:            entity_pos,
+                            to:              target,
+                            requested_at_ms: now_ms,
+                        });
                     }
 
                     self.entity_paths
@@ -560,9 +1009,14 @@ impl ZoneSimulation {
         // ── Apply behavior and movement ──
         {
             let entity = self.wildlife.get_mut(entity_id).unwrap();
+            // Clear wander target when switching away from wandering
+            if decision.behavior != BehaviorState::Wandering && entity.wander_target.is_some() {
+                entity.wander_target = None;
+            }
             entity.current_behavior = decision.behavior;
             entity.target_entity_id = decision.target_id;
 
+            let from_position = entity.position;
             let mut speed = base_speed;
 
             // Apply heat stress speed penalty
@@ -658,14 +1112,22 @@ impl ZoneSimulation {
                 }
             }
 
-            // Always emit a Move event so the game server has current positions
-            // for ALL entities, not just actively moving ones.
-            self.pending_events.push(WildlifeEvent::Move {
-                entity_id: entity.id.clone(),
-                position: entity.position,
-                heading: entity.heading,
-                behavior: entity.current_behavior,
-            });
+            // Emit Move only when the entity actually moved — flooding 2400
+            // identical "still-here" updates per tick at 10 Hz pushed Redis's
+            // pub/sub output buffer past its limit and dropped the subscriber.
+            // Behaviour change (e.g. idle → fleeing) is also worth a tick.
+            let position_changed =
+                (entity.position.x - from_position.x).abs() > 0.001 ||
+                (entity.position.z - from_position.z).abs() > 0.001;
+            if position_changed {
+                self.pending_events.push(WildlifeEvent::Move {
+                    entity_id: entity.id.clone(),
+                    from_position,
+                    position: entity.position,
+                    heading: entity.heading,
+                    behavior: entity.current_behavior,
+                });
+            }
         }
 
         // Advance path index if we reached the waypoint
@@ -675,6 +1137,12 @@ impl ZoneSimulation {
                     if entity.position.distance_2d(&wp) < 1.5 {
                         if let Some(path) = self.entity_paths.get_mut(entity_id) {
                             path.current_index += 1;
+                            // Clear wander target if we reached the end of a wander path
+                            if path.current_index >= path.waypoints.len() {
+                                if let Some(e) = self.wildlife.get_mut(entity_id) {
+                                    e.wander_target = None;
+                                }
+                            }
                         }
                     }
                 }
@@ -752,25 +1220,43 @@ impl ZoneSimulation {
         if should_check_birth {
             self.give_birth(entity_id.to_string(), now_ms, rng);
         }
+
+        let _t_total = _t_entity_start.elapsed().as_micros();
+        if _t_total > 5_000 {
+            tracing::warn!(
+                "ENTITY_SLOW total={} pre_perc={} after_perc={} after_ctx={} species={}",
+                _t_total, _t_pre_perc, _t_perc_done, _t_ctx_done, species.id,
+            );
+        }
     }
 
     fn build_context(&self, entity: &WildlifeEntity, species: &WildlifeSpecies) -> EnvironmentContext {
         let max_range = species.sight_range.max(species.hearing_range).max(species.smell_range);
+        let max_range_sq = max_range * max_range;
 
         let mut threats = Vec::new();
         let mut prey = Vec::new();
         let mut mates = Vec::new();
 
-        // Check other wildlife
-        for other in self.wildlife.values() {
-            if other.id == entity.id || !other.is_alive {
-                continue;
-            }
+        // Check other wildlife — use the spatial grid so we only iterate
+        // entities in cells that overlap our perception circle, not all 1500.
+        let mut neighbour_ids: Vec<String> = Vec::new();
+        self.spatial_query(entity.position, max_range, |id| {
+            if id != entity.id { neighbour_ids.push(id.to_string()); }
+        });
 
-            let distance = entity.position.distance_to(&other.position);
-            if distance > max_range {
-                continue;
-            }
+        for other_id in &neighbour_ids {
+            let other = match self.wildlife.get(other_id) {
+                Some(e) if e.is_alive => e,
+                _ => continue,
+            };
+
+            let dx = entity.position.x - other.position.x;
+            let dy = entity.position.y - other.position.y;
+            let dz = entity.position.z - other.position.z;
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            if dist_sq > max_range_sq { continue; }
+            let distance = dist_sq.sqrt();
 
             let other_species = match get_species(&other.species_id) {
                 Some(s) => s,
@@ -828,22 +1314,18 @@ impl ZoneSimulation {
         prey.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
         mates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
 
-        // Water sources (from terrain or fallback hardcoded)
-        let nearby_water: Vec<WaterSource> = if let Some(ref terrain) = self.terrain {
-            if let Some(water_pos) = terrain.nearest_water(
-                entity.position.x,
-                entity.position.z,
-                species.smell_range,
-            ) {
-                let distance = entity.position.distance_2d(&water_pos);
-                vec![WaterSource {
-                    position: water_pos,
-                    distance,
-                }]
+        // Water sources — read from the entity's cached value (refreshed in
+        // update_wildlife_entity at most every few seconds) instead of
+        // scanning the terrain grid every tick.
+        let nearby_water: Vec<WaterSource> = if let Some(water_pos) = entity.cached_water {
+            let distance = entity.position.distance_2d(&water_pos);
+            if distance <= species.smell_range {
+                vec![WaterSource { position: water_pos, distance }]
             } else {
                 Vec::new()
             }
-        } else {
+        } else if self.terrain.is_none() {
+            // No terrain — fall back to hardcoded water sources (cheap)
             self.water_sources
                 .iter()
                 .map(|pos| WaterSource {
@@ -852,24 +1334,40 @@ impl ZoneSimulation {
                 })
                 .filter(|w| w.distance <= species.smell_range)
                 .collect()
+        } else {
+            Vec::new()
         };
 
-        // Food (plants for herbivores)
+        // Food (plants for herbivores) — use the plant spatial grid so we
+        // only iterate cells overlapping the perception circle, not all 105k
+        // plants.  Was the dominant per-entity cost (25 ms/herbivore) before.
         let nearby_food: Vec<PerceivedEntity> = if species.is_herbivore {
-            self.plants
-                .values()
-                .filter(|p| p.is_alive && matches!(p.current_stage, PlantGrowthStage::Mature | PlantGrowthStage::Growing | PlantGrowthStage::Flowering))
-                .map(|p| PerceivedEntity {
-                    id: p.id.clone(),
-                    position: p.position,
-                    distance: entity.position.distance_to(&p.position),
-                    size_class: SizeClass::Tiny,
-                    diet_type: None,
-                    species_id: Some(p.species_id.clone()),
-                    is_player: false,
-                })
-                .filter(|f| f.distance <= species.smell_range)
-                .collect()
+            let smell_sq = species.smell_range * species.smell_range;
+            let mut food = Vec::new();
+            self.plant_spatial_query(entity.position, species.smell_range, |id| {
+                if let Some(p) = self.plants.get(id) {
+                    if !p.is_alive { return; }
+                    if !matches!(
+                        p.current_stage,
+                        PlantGrowthStage::Mature | PlantGrowthStage::Growing | PlantGrowthStage::Flowering,
+                    ) { return; }
+                    let dx = entity.position.x - p.position.x;
+                    let dy = entity.position.y - p.position.y;
+                    let dz = entity.position.z - p.position.z;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq > smell_sq { return; }
+                    food.push(PerceivedEntity {
+                        id:         p.id.clone(),
+                        position:   p.position,
+                        distance:   dist_sq.sqrt(),
+                        size_class: SizeClass::Tiny,
+                        diet_type:  None,
+                        species_id: Some(p.species_id.clone()),
+                        is_player:  false,
+                    });
+                }
+            });
+            food
         } else {
             Vec::new()
         };
@@ -1120,6 +1618,7 @@ impl ZoneSimulation {
         let plant = self.plants.get_mut(plant_id).unwrap();
         plant.is_alive = false;
         plant.current_stage = PlantGrowthStage::Dead;
+        self.plant_grid_dirty = true;
 
         // Emit event
         self.pending_events.push(WildlifeEvent::PlantEaten {
@@ -1274,16 +1773,21 @@ impl ZoneSimulation {
     }
 
     fn check_spawns(&mut self, now_ms: i64, _rng: &mut impl Rng) {
-        // Only do emergency respawns when population drops critically low
-        // Normal population growth should come from mating
-        const MIN_POPULATION: usize = 3;
-        const RESPAWN_MALES: usize = 2;
-        const RESPAWN_FEMALES: usize = 5;
+        // Emergency respawns when population drops critically low.
+        // Thresholds scale with zone area so a 6 km² map doesn't wait
+        // until 3 deer remain before replenishing.
+        let area = self.zone_area_km2();
 
-        // All species eligible for emergency respawn
-        let species_ids = ["rabbit", "fox", "deer", "wolf", "boar"];
+        // (species, min_density/km², respawn_males_density, respawn_females_density, min_pop, min_m, min_f)
+        let specs: &[(&str, f64, f64, f64, usize, usize, usize)] = &[
+            ("rabbit", 1.5,  1.0, 2.0,  3, 2, 3),
+            ("fox",    0.5,  0.5, 0.5,  3, 1, 2),
+            ("deer",   0.8,  0.8, 1.2,  3, 1, 2),
+            ("wolf",   0.3,  0.3, 0.5,  2, 1, 2),
+            ("boar",   0.5,  0.5, 0.8,  3, 1, 2),
+        ];
 
-        for species_id in species_ids {
+        for &(species_id, min_den, rm_den, rf_den, min_pop, min_m, min_f) in specs {
             let species = match get_species(species_id) {
                 Some(s) => s,
                 None => continue,
@@ -1292,8 +1796,6 @@ impl ZoneSimulation {
             // When terrain is available, check if ANY cell matches a preferred biome.
             // Otherwise fall back to zone-level biome check.
             let biome_ok = if self.terrain.is_some() {
-                // With terrain, we rely on find_walkable_spawn_position to find
-                // biome-appropriate cells. Just check the species has preferences.
                 !species.biome_preferences.is_empty()
             } else {
                 species.biome_preferences.iter().any(|p| p.biome == self.biome)
@@ -1303,20 +1805,26 @@ impl ZoneSimulation {
                 continue;
             }
 
+            let min_population = ((min_den * area).round() as usize).max(min_pop);
+            let respawn_males  = ((rm_den * area).round() as usize).max(min_m);
+            let respawn_females = ((rf_den * area).round() as usize).max(min_f);
+
             let alive_count = self
                 .wildlife
                 .values()
                 .filter(|e| e.species_id == species_id && e.is_alive)
                 .count();
 
-            if alive_count < MIN_POPULATION {
+            if alive_count < min_population {
                 tracing::info!(
-                    "Population of {} critically low ({} < {}), spawning reinforcements",
+                    "Population of {} critically low ({} < {}), spawning reinforcements ({}M + {}F)",
                     species_id,
                     alive_count,
-                    MIN_POPULATION
+                    min_population,
+                    respawn_males,
+                    respawn_females
                 );
-                self.spawn_population(species_id, RESPAWN_MALES, RESPAWN_FEMALES, now_ms);
+                self.spawn_population(species_id, respawn_males, respawn_females, now_ms);
             }
         }
     }
@@ -1425,6 +1933,15 @@ impl ZoneSimulation {
 
             in_combat: false,
             last_hostile_at: 0,
+
+            wander_target: None,
+            wander_target_set_at: 0,
+
+            cached_water: None,
+            cached_water_at_ms: 0,
+            cached_shelter: None,
+            cached_shelter_at_ms: 0,
+            last_update_tick_ms: 0,
         };
 
         Self::apply_stat_scaling(&mut entity, &species);
@@ -1450,20 +1967,26 @@ impl ZoneSimulation {
     /// Called when the game server restarts (sends ZoneInfo for a zone we
     /// already have) so the bridge can rebuild its entity registry.
     pub fn re_announce_all(&mut self) {
-        let count = self.wildlife.values().filter(|e| e.is_alive).count();
+        let wildlife_count = self.wildlife.values().filter(|e| e.is_alive).count();
         info!(
-            "Re-announcing {} living entities for zone {}",
-            count, self.zone_id
+            "Re-announcing {} living wildlife for zone {}",
+            wildlife_count, self.zone_id
         );
 
         for entity in self.wildlife.values().filter(|e| e.is_alive) {
             self.pending_events.push(WildlifeEvent::Spawn {
-                entity_id: entity.id.clone(),
+                entity_id:  entity.id.clone(),
                 species_id: entity.species_id.clone(),
-                position: entity.position,
-                zone_id: self.zone_id.clone(),
+                position:   entity.position,
+                zone_id:    self.zone_id.clone(),
             });
         }
+
+        // Plants are intentionally NOT re-announced.  They are static; the
+        // bridge streams them to each player once on join via
+        // streamPlantsOnJoin and the client caches them locally.  Re-emitting
+        // 100k+ PlantSpawn events every 15 s on a slow tick was a major
+        // contributor to over-budget warnings.
     }
 
     /// Spawn an initial population for a species
@@ -1672,6 +2195,13 @@ impl ZoneSimulation {
             None => return,
         };
 
+        // Skip plants that have nothing left to do — fully mature with no
+        // further stages.  This is ~99 % of trees in a mature forest, so
+        // short-circuiting here gets us back the whole plant-update budget.
+        if plant.stage_index + 1 >= species.growth_stages.len() {
+            return;
+        }
+
         let current_season = self.current_climate
             .as_ref()
             .map(|c| c.season)
@@ -1761,11 +2291,16 @@ impl ZoneSimulation {
     }
 
     fn check_plant_spawns(&mut self, now_ms: i64, rng: &mut impl Rng) {
-        // Target plant counts by category
-        const TARGET_GROUND_COVER: usize = 60;  // grass + clover
-        const TARGET_VEGETABLES: usize = 15;     // carrot, potato, onion, garlic
-        const TARGET_HERBS: usize = 12;           // herb_sage, mushroom, berry_bush
-        const TARGET_TREES: usize = 6;            // apple_tree, pear_tree
+        // Target plant counts scaled to zone area (densities per km²).
+        let area = self.zone_area_km2();
+
+        let target_ground = ((100.0 * area).round() as usize).max(60);   // grass + clover
+        let target_veggies = ((20.0 * area).round() as usize).max(15);   // carrot, potato, onion, garlic
+        let target_herbs   = ((16.0 * area).round() as usize).max(12);   // herb_sage, mushroom, berry_bush
+        let target_trees   = ((12.0 * area).round() as usize).max(6);    // apple_tree, pear_tree
+
+        // Batch size also scales — don't drip-feed one plant at a time on a 6 km² map
+        let batch = ((4.0 * area).round() as usize).clamp(1, 20);
 
         let ground_count = self
             .plants
@@ -1806,44 +2341,71 @@ impl ZoneSimulation {
             .count();
 
         // Spawn ground cover (grass + clover)
-        if ground_count < TARGET_GROUND_COVER {
-            let to_spawn = (TARGET_GROUND_COVER - ground_count).min(8);
+        if ground_count < target_ground {
+            let to_spawn = (target_ground - ground_count).min(batch * 2);
             for _ in 0..to_spawn {
                 let species = if rng.gen_bool(0.55) { "grass" } else { "clover" };
                 self.spawn_plant(species, now_ms, rng);
             }
         }
 
-        // Spawn vegetables (randomly pick one)
-        if veggie_count < TARGET_VEGETABLES {
+        // Spawn vegetables
+        if veggie_count < target_veggies {
             let veggies = ["carrot", "potato", "onion", "garlic"];
-            let species = veggies[rng.gen_range(0..veggies.len())];
-            self.spawn_plant(species, now_ms, rng);
+            let to_spawn = (target_veggies - veggie_count).min(batch);
+            for _ in 0..to_spawn {
+                let species = veggies[rng.gen_range(0..veggies.len())];
+                self.spawn_plant(species, now_ms, rng);
+            }
         }
 
         // Spawn herbs/bushes/mushrooms
-        if herb_count < TARGET_HERBS {
+        if herb_count < target_herbs {
             let herbs = ["herb_sage", "mushroom", "berry_bush"];
-            let species = herbs[rng.gen_range(0..herbs.len())];
-            self.spawn_plant(species, now_ms, rng);
+            let to_spawn = (target_herbs - herb_count).min(batch);
+            for _ in 0..to_spawn {
+                let species = herbs[rng.gen_range(0..herbs.len())];
+                self.spawn_plant(species, now_ms, rng);
+            }
         }
 
-        // Spawn trees (rare)
-        if tree_count < TARGET_TREES {
+        // Spawn trees
+        if tree_count < target_trees {
             let trees = ["apple_tree", "pear_tree"];
-            let species = trees[rng.gen_range(0..trees.len())];
-            self.spawn_plant(species, now_ms, rng);
+            let to_spawn = (target_trees - tree_count).min(batch);
+            for _ in 0..to_spawn {
+                let species = trees[rng.gen_range(0..trees.len())];
+                self.spawn_plant(species, now_ms, rng);
+            }
         }
     }
 
     fn spawn_plant(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng) -> Option<String> {
+        self.spawn_plant_inner(species_id, now_ms, rng, false, false)
+    }
+
+    fn spawn_plant_forest(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng) -> Option<String> {
+        self.spawn_plant_inner(species_id, now_ms, rng, true, false)
+    }
+
+    fn spawn_plant_mature(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng) -> Option<String> {
+        self.spawn_plant_inner(species_id, now_ms, rng, false, true)
+    }
+
+    fn spawn_plant_forest_mature(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng) -> Option<String> {
+        self.spawn_plant_inner(species_id, now_ms, rng, true, true)
+    }
+
+    fn spawn_plant_inner(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng, forest_only: bool, start_mature: bool) -> Option<String> {
         let species = get_plant_species(species_id)?;
 
         // Find a valid position (respects terrain biome + structure rules)
         let is_ground_cover = matches!(species_id, "grass" | "clover");
         let pos = if let Some(ref terrain) = self.terrain {
             let mut found = None;
-            for _ in 0..30 {
+            // Forest-only passes need more attempts since they reject out-of-polygon positions.
+            let max_attempts = if forest_only { 300 } else { 100 };
+            for _ in 0..max_attempts {
                 let x = rng.gen_range(self.bounds_min.x..self.bounds_max.x);
                 let z = rng.gen_range(self.bounds_min.z..self.bounds_max.z);
 
@@ -1852,10 +2414,29 @@ impl ZoneSimulation {
                     continue;
                 }
 
-                // Check per-cell biome compatibility
-                let cell_biome = terrain_biome_to_zone_biome(terrain.get_biome_at(x, z));
-                if !species.preferred_biomes.contains(&cell_biome) {
-                    continue;
+                let is_tree = matches!(species.plant_type, PlantType::Tree);
+
+                // Trees need clearance from buildings, roads, and water bodies.
+                // Use exact OSM geometry when loaded, navmesh flags as fallback.
+                if is_tree {
+                    if !terrain.clear_of_structures(x, z, self.tree_structure_clearance) { continue; }
+                    if !terrain.clear_of_roads(x, z, self.tree_road_clearance) { continue; }
+                    if !terrain.clear_of_water(x, z, self.tree_water_clearance) { continue; }
+                    if !self.civic_map.clear_for_tree(x, z) { continue; }
+                }
+
+                // Forest-only pass: reject positions outside forest polygons.
+                let in_forest = is_tree && !self.forest_map.is_empty() && self.forest_map.contains(x, z);
+                if forest_only && !in_forest { continue; }
+
+                // Hybrid: OSM polygon positions are always valid for trees (richer coverage in
+                // known forests); positions outside polygons fall back to terrain biome so zones
+                // without OSM data — e.g. player-created towns — still get procedural tree cover.
+                if !in_forest {
+                    let cell_biome = terrain_biome_to_zone_biome(terrain.get_biome_at(x, z));
+                    if !species.preferred_biomes.contains(&cell_biome) {
+                        continue;
+                    }
                 }
 
                 let y = terrain.get_elevation(x, z) as f64;
@@ -1875,15 +2456,24 @@ impl ZoneSimulation {
             )
         };
 
+        let variant = (self.next_plant_id % 5) as u8;
         let id = format!("plant_{}_{}", species_id, self.next_plant_id);
         self.next_plant_id += 1;
 
-        // Start at first growth stage
-        let initial_stage = species
-            .growth_stages
-            .first()
-            .map(|s| s.stage)
-            .unwrap_or(PlantGrowthStage::Seed);
+        let (initial_stage, stage_index, stage_progress) = if start_mature {
+            let idx = species.growth_stages.iter()
+                .position(|s| s.stage == PlantGrowthStage::Mature)
+                .unwrap_or_else(|| species.growth_stages.len().saturating_sub(1));
+            let stage = species.growth_stages.get(idx)
+                .map(|s| s.stage)
+                .unwrap_or(PlantGrowthStage::Mature);
+            (stage, idx, 1.0f64)
+        } else {
+            let stage = species.growth_stages.first()
+                .map(|s| s.stage)
+                .unwrap_or(PlantGrowthStage::Seed);
+            (stage, 0usize, 0.0f64)
+        };
 
         let plant = PlantEntity {
             id: id.clone(),
@@ -1893,8 +2483,8 @@ impl ZoneSimulation {
 
             current_stage: initial_stage,
             stage_started_at: now_ms,
-            stage_progress: 0.0,
-            stage_index: 0,
+            stage_progress,
+            stage_index,
 
             is_alive: true,
             is_dormant: false,
@@ -1902,60 +2492,161 @@ impl ZoneSimulation {
             last_harvested_at: None,
 
             spawned_at: now_ms,
+            variant,
         };
 
         self.plants.insert(id.clone(), plant);
+        self.plant_grid_dirty = true;
+
+        // Notify the game server so clients can see the plant.
+        self.pending_events.push(WildlifeEvent::PlantSpawn {
+            plant_id: id.clone(),
+            species_id: species_id.to_string(),
+            position: pos,
+            zone_id: self.zone_id.clone(),
+            stage: initial_stage,
+            variant,
+        });
+
         Some(id)
     }
 
-    /// Spawn initial plants for the zone
-    pub fn spawn_initial_plants(&mut self, now_ms: i64) {
+    /// Spawn initial plants for the zone, scaled to zone area.
+    ///
+    /// Densities are per km².  The 200 m fallback zone (~0.04 km²) gets
+    /// the `min` values; a 2500 m tile (~6.25 km²) gets ≈150× more.
+    /// Spawn all flora (trees + plants) from scratch and return positions for caching.
+    pub fn spawn_initial_flora(&mut self, now_ms: i64) -> Vec<CachedPlant> {
         let mut rng = rand::thread_rng();
+        let area = self.zone_area_km2();
+        let zone_mult   = self.tree_zone_multiplier;
+        let forest_mult = self.tree_forest_multiplier;
+        let has_forest  = !self.forest_map.is_empty();
 
-        // Ground cover
-        for _ in 0..30 {
-            self.spawn_plant("grass", now_ms, &mut rng);
-        }
-        for _ in 0..15 {
-            self.spawn_plant("clover", now_ms, &mut rng);
+        // (species, base_density_per_km2, minimum, max_zone_wide, max_forest_extra)
+        //
+        // Caps prevent runaway counts on large zones (41 km² × 2000/km² × 3× = 250k pine
+        // without them). Density still scales normally on small tiles; large tiles hit the cap.
+        let tree_specs: &[(&str, f64, usize, usize, usize)] = &[
+            ("pine_tree",  2000.0,  500,  15_000,  35_000),
+            ("oak_tree",   1500.0,  400,  12_000,  28_000),
+            ("maple_tree", 1000.0,  300,   8_000,  18_000),
+        ];
+
+        let other_specs: &[(&str, f64, usize)] = &[
+            // Ground cover
+            ("grass",      300.0,  180),
+            ("clover",     150.0,   90),
+            // Vegetables
+            ("carrot",      24.0,   30),
+            ("potato",      18.0,   18),
+            ("onion",       18.0,   18),
+            ("garlic",      12.0,   12),
+            // Herbs / mushrooms / berries
+            ("herb_sage",   24.0,   24),
+            ("mushroom",    30.0,   30),
+            ("berry_bush",  24.0,   24),
+            // Fruit trees
+            ("apple_tree",  25.0,   15),
+            ("pear_tree",   20.0,   15),
+        ];
+
+        // Trees — zone-wide pass at zone_mult, then forest-only extra pass so
+        // forest polygons reach forest_mult total density.
+        // All initial-generation plants start mature so the forest is immediately
+        // full-grown; seed→mature growth applies only to organically respawned plants.
+        for &(species, density, minimum, max_zone, max_forest) in tree_specs {
+            let zone_count = ((density * zone_mult * area).round() as usize)
+                .max(minimum)
+                .min(max_zone);
+            for _ in 0..zone_count {
+                self.spawn_plant_mature(species, now_ms, &mut rng);
+            }
+            if has_forest && forest_mult > zone_mult {
+                let extra = ((density * (forest_mult - zone_mult) * area).round() as usize)
+                    .min(max_forest);
+                for _ in 0..extra {
+                    self.spawn_plant_forest_mature(species, now_ms, &mut rng);
+                }
+            }
         }
 
-        // Vegetables
-        for _ in 0..5 {
-            self.spawn_plant("carrot", now_ms, &mut rng);
-        }
-        for _ in 0..3 {
-            self.spawn_plant("potato", now_ms, &mut rng);
-        }
-        for _ in 0..3 {
-            self.spawn_plant("onion", now_ms, &mut rng);
-        }
-        for _ in 0..2 {
-            self.spawn_plant("garlic", now_ms, &mut rng);
-        }
-
-        // Herbs, mushrooms, berries
-        for _ in 0..4 {
-            self.spawn_plant("herb_sage", now_ms, &mut rng);
-        }
-        for _ in 0..5 {
-            self.spawn_plant("mushroom", now_ms, &mut rng);
-        }
-        for _ in 0..4 {
-            self.spawn_plant("berry_bush", now_ms, &mut rng);
-        }
-
-        // Trees
-        for _ in 0..3 {
-            self.spawn_plant("apple_tree", now_ms, &mut rng);
-        }
-        for _ in 0..3 {
-            self.spawn_plant("pear_tree", now_ms, &mut rng);
+        // Non-tree flora — unchanged density, no forest multiplier
+        for &(species, density, minimum) in other_specs {
+            let count = ((density * area).round() as usize).max(minimum);
+            for _ in 0..count {
+                self.spawn_plant_mature(species, now_ms, &mut rng);
+            }
         }
 
         tracing::info!(
-            "Spawned {} initial plants in zone {}",
+            "Spawned {} flora in zone {} ({:.2} km²)",
             self.plants.len(),
+            self.zone_id,
+            area
+        );
+
+        self.plants.values()
+            .filter(|p| p.is_alive)
+            .map(|p| CachedPlant {
+                species: p.species_id.clone(),
+                x: p.position.x,
+                y: p.position.y,
+                z: p.position.z,
+                variant: p.variant,
+            })
+            .collect()
+    }
+
+    /// Restore all flora from a pre-computed cache at Mature stage.
+    pub fn load_cached_flora(&mut self, plants: Vec<CachedPlant>, now_ms: i64) {
+        let count = plants.len();
+        for plant in plants {
+            let species = match get_plant_species(&plant.species) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let mature_idx = species.growth_stages.iter()
+                .position(|s| s.stage == PlantGrowthStage::Mature)
+                .unwrap_or_else(|| species.growth_stages.len().saturating_sub(1));
+            let stage = species.growth_stages.get(mature_idx)
+                .map(|s| s.stage)
+                .unwrap_or(PlantGrowthStage::Mature);
+
+            let id = format!("plant_{}_{}", plant.species, self.next_plant_id);
+            self.next_plant_id += 1;
+
+            let pos = Vector3::new(plant.x, plant.y, plant.z);
+            self.plants.insert(id.clone(), PlantEntity {
+                id: id.clone(),
+                species_id: plant.species.clone(),
+                position: pos,
+                zone_id: self.zone_id.clone(),
+                current_stage: stage,
+                stage_started_at: now_ms,
+                stage_progress: 1.0,
+                stage_index: mature_idx,
+                is_alive: true,
+                is_dormant: false,
+                times_harvested: 0,
+                last_harvested_at: None,
+                spawned_at: now_ms,
+                variant: plant.variant,
+            });
+            self.plant_grid_dirty = true;
+            self.pending_events.push(WildlifeEvent::PlantSpawn {
+                plant_id: id,
+                species_id: plant.species,
+                position: pos,
+                zone_id: self.zone_id.clone(),
+                stage,
+                variant: plant.variant,
+            });
+        }
+        tracing::info!(
+            "Loaded {} cached flora for zone {}",
+            count,
             self.zone_id
         );
     }

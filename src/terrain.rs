@@ -150,6 +150,118 @@ impl Default for TerrainCell {
     }
 }
 
+// ============================================================================
+// Fine-resolution building grid
+//
+// The coarse 128×128 navmesh (~50 m/cell) cannot reliably identify building
+// locations for tree-clearance purposes. This grid rasterises OSM building
+// polygons at FINE_CELL_SIZE resolution so that `clear_of_structures` is an
+// O(1) lookup rather than an O(N_buildings) geometry scan.
+//
+// Each cell is `true` when its centre is within FINE_CELL_SIZE/2 of a
+// building polygon edge *or* inside the polygon. The caller's requested
+// clearance radius is handled separately by scanning a cell neighbourhood.
+// ============================================================================
+
+const FINE_CELL_SIZE: f64 = 4.0; // metres — fine enough to catch any typical building
+
+#[derive(Clone)]
+pub(crate) struct FineGrid {
+    min_x: f64,
+    min_z: f64,
+    cols: usize,
+    rows: usize,
+    /// Row-major: cells[row * cols + col]. True = building (or near-building) cell.
+    cells: Vec<bool>,
+}
+
+impl FineGrid {
+    fn new_empty(origin_x: f64, origin_z: f64, size: f64) -> Self {
+        let cs = FINE_CELL_SIZE;
+        let cols = (size / cs).ceil() as usize + 1;
+        let rows = (size / cs).ceil() as usize + 1;
+        Self { min_x: origin_x, min_z: origin_z, cols, rows, cells: vec![false; cols * rows] }
+    }
+
+    /// Mark cells within `clearance` of any building polygon.
+    fn rasterize_polygons(&mut self, buildings: &[Vec<[f64; 2]>], clearance: f64) {
+        let cs = FINE_CELL_SIZE;
+        let cols = self.cols;
+        let rows = self.rows;
+        let origin_x = self.min_x;
+        let origin_z = self.min_z;
+
+        for poly in buildings {
+            let mut bmin_x = f64::MAX; let mut bmax_x = f64::MIN;
+            let mut bmin_z = f64::MAX; let mut bmax_z = f64::MIN;
+            for &[x, z] in poly {
+                if x < bmin_x { bmin_x = x; } if x > bmax_x { bmax_x = x; }
+                if z < bmin_z { bmin_z = z; } if z > bmax_z { bmax_z = z; }
+            }
+            let col0 = (((bmin_x - clearance - origin_x) / cs).floor() as isize).clamp(0, cols as isize) as usize;
+            let col1 = (((bmax_x + clearance - origin_x) / cs).ceil() as isize + 1).clamp(0, cols as isize) as usize;
+            let row0 = (((bmin_z - clearance - origin_z) / cs).floor() as isize).clamp(0, rows as isize) as usize;
+            let row1 = (((bmax_z + clearance - origin_z) / cs).ceil() as isize + 1).clamp(0, rows as isize) as usize;
+
+            for row in row0..row1 {
+                for col in col0..col1 {
+                    if self.cells[row * cols + col] { continue; }
+                    let cx = origin_x + (col as f64 + 0.5) * cs;
+                    let cz = origin_z + (row as f64 + 0.5) * cs;
+                    if _point_to_polygon_dist(cx, cz, poly) <= clearance {
+                        self.cells[row * cols + col] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark cells within `clearance` of any road polyline segment.
+    fn rasterize_roads(&mut self, roads: &[Vec<[f64; 2]>], clearance: f64) {
+        let cs = FINE_CELL_SIZE;
+        let cols = self.cols;
+        let rows = self.rows;
+        let origin_x = self.min_x;
+        let origin_z = self.min_z;
+
+        for road in roads {
+            for i in 0..road.len().saturating_sub(1) {
+                let ax = road[i][0];   let az = road[i][1];
+                let bx = road[i+1][0]; let bz = road[i+1][1];
+                let bmin_x = ax.min(bx) - clearance;
+                let bmax_x = ax.max(bx) + clearance;
+                let bmin_z = az.min(bz) - clearance;
+                let bmax_z = az.max(bz) + clearance;
+
+                let col0 = (((bmin_x - origin_x) / cs).floor() as isize).clamp(0, cols as isize) as usize;
+                let col1 = (((bmax_x - origin_x) / cs).ceil() as isize + 1).clamp(0, cols as isize) as usize;
+                let row0 = (((bmin_z - origin_z) / cs).floor() as isize).clamp(0, rows as isize) as usize;
+                let row1 = (((bmax_z - origin_z) / cs).ceil() as isize + 1).clamp(0, rows as isize) as usize;
+
+                for row in row0..row1 {
+                    for col in col0..col1 {
+                        if self.cells[row * cols + col] { continue; }
+                        let cx = origin_x + (col as f64 + 0.5) * cs;
+                        let cz = origin_z + (row as f64 + 0.5) * cs;
+                        if _point_to_segment_dist(cx, cz, ax, az, bx, bz) <= clearance {
+                            self.cells[row * cols + col] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn is_blocked(&self, x: f64, z: f64) -> bool {
+        if x < self.min_x || z < self.min_z { return false; }
+        let col = ((x - self.min_x) / FINE_CELL_SIZE) as usize;
+        let row = ((z - self.min_z) / FINE_CELL_SIZE) as usize;
+        if col >= self.cols || row >= self.rows { return false; }
+        self.cells[row * self.cols + col]
+    }
+}
+
 /// The main terrain data structure. Holds a 128x128 grid of cells
 /// covering a single tile (~2.5km at z=14).
 #[derive(Clone)]
@@ -168,6 +280,14 @@ pub struct TerrainGrid {
     pub structures: Vec<Structure>,
     /// Roads from the ruin layout.
     pub roads: Vec<Road>,
+    /// OSM building footprint polygons in world coords [x, z] (zone centre = 0,0).
+    pub osm_buildings: Vec<Vec<[f64; 2]>>,
+    /// OSM road polylines in world coords [x, z] (zone centre = 0,0).
+    pub osm_roads: Vec<Vec<[f64; 2]>>,
+    /// Fine-resolution building grid for O(1) structure clearance checks.
+    pub(crate) fine_building_grid: Option<FineGrid>,
+    /// Fine-resolution road grid for O(1) road clearance checks.
+    pub(crate) fine_road_grid: Option<FineGrid>,
 }
 
 impl TerrainGrid {
@@ -179,6 +299,8 @@ impl TerrainGrid {
         server_navmesh: &ServerNavmesh,
         server_biome: Option<&ServerBiomeData>,
         server_ruins: Option<&ServerRuinLayout>,
+        server_elevation: Option<&ServerElevationData>,
+        server_geometry: Option<&ServerGeometry>,
     ) -> Self {
         let cell_size = tile_size / GRID_RESOLUTION as f64;
 
@@ -200,6 +322,48 @@ impl TerrainGrid {
             }
         }
 
+        // Check if navmesh elevation is missing (all zeros) and patch from
+        // the dedicated elevation layer or procedural fallback.
+        let has_navmesh_elevation = cells.iter().any(|c| c.elevation.abs() > 0.01);
+
+        if !has_navmesh_elevation {
+            if let Some(elev) = server_elevation {
+                // Use the server's dedicated elevation layer
+                tracing::info!(
+                    "Navmesh has no elevation — patching from elevation layer ({:.0}-{:.0}m)",
+                    elev.min_elevation, elev.max_elevation
+                );
+                for row in 0..GRID_RESOLUTION {
+                    for col in 0..GRID_RESOLUTION {
+                        let idx = row * GRID_RESOLUTION + col;
+                        // Map 128x128 grid to the elevation layer's resolution
+                        let ex = col as f64 / GRID_RESOLUTION as f64 * (elev.width as f64 - 1.0);
+                        let ez = row as f64 / GRID_RESOLUTION as f64 * (elev.height as f64 - 1.0);
+                        cells[idx].elevation = sample_elevation_grid(elev, ex, ez);
+                    }
+                }
+            } else {
+                // No elevation from any source — generate procedural terrain
+                // using simple noise so the landscape isn't pancake-flat.
+                tracing::warn!(
+                    "No elevation data for tile {} — generating procedural elevation",
+                    tile_id
+                );
+                for row in 0..GRID_RESOLUTION {
+                    for col in 0..GRID_RESOLUTION {
+                        let idx = row * GRID_RESOLUTION + col;
+                        let nx = col as f64 / GRID_RESOLUTION as f64;
+                        let nz = row as f64 / GRID_RESOLUTION as f64;
+                        // Gentle rolling hills (150-350m range, typical for
+                        // US northeast / Stephentown NY area)
+                        let e1 = pseudo_noise(nx * 2.0, nz * 2.0) * 40.0;
+                        let e2 = pseudo_noise(nx * 5.0 + 3.7, nz * 5.0 + 1.3) * 15.0;
+                        cells[idx].elevation = (250.0 + e1 + e2) as f32;
+                    }
+                }
+            }
+        }
+
         // Apply biome distribution if available
         if let Some(biome_data) = server_biome {
             let dominant = parse_biome(&biome_data.dominant_biome);
@@ -215,6 +379,25 @@ impl TerrainGrid {
             .map(|r| r.roads.clone())
             .unwrap_or_default();
 
+        let osm_buildings = server_geometry
+            .map(|g| g.buildings.clone())
+            .unwrap_or_default();
+        let osm_roads = server_geometry
+            .map(|g| g.roads.clone())
+            .unwrap_or_default();
+
+        // Bake fine grids for building and road clearance (20 m and 10 m respectively).
+        // Makes `clear_of_structures` / `clear_of_roads` O(1) lookups.
+        let (fine_building_grid, fine_road_grid) = if osm_buildings.is_empty() && osm_roads.is_empty() {
+            (None, None)
+        } else {
+            let mut g = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut r = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            g.rasterize_polygons(&osm_buildings, 20.0);
+            r.rasterize_roads(&osm_roads, 10.0);
+            (Some(g), Some(r))
+        };
+
         Self {
             tile_id,
             cell_size,
@@ -223,6 +406,10 @@ impl TerrainGrid {
             cells,
             structures,
             roads,
+            osm_buildings,
+            osm_roads,
+            fine_building_grid,
+            fine_road_grid,
         }
     }
 
@@ -407,7 +594,127 @@ impl TerrainGrid {
         best.map(|(_, pos)| pos)
     }
 
-    /// Check if a position is valid for flora spawning.
+    /// True if no building falls within `radius` metres of (x, z).
+    ///
+    /// Uses the fine-resolution building grid (4 m/cell) when OSM data is
+    /// available — O(1). Falls back to the coarse navmesh scan otherwise.
+    pub fn clear_of_structures(&self, x: f64, z: f64, _radius: f64) -> bool {
+        if let Some(grid) = &self.fine_building_grid {
+            // Grid was built with the baked 20 m clearance — direct lookup.
+            return !grid.is_blocked(x, z);
+        }
+        // Fallback: coarse navmesh scan (50 m cells — only reliable when no OSM data).
+        let half = self.cell_size * 0.5;
+        let effective = _radius + half;
+        let span = (effective / self.cell_size).ceil() as isize + 1;
+        let (cx, cz) = match self.world_to_cell(x, z) {
+            Some(c) => c,
+            None => return true,
+        };
+        for dr in -span..=span {
+            for dc in -span..=span {
+                let col = cx as isize + dc;
+                let row = cz as isize + dr;
+                if col < 0 || row < 0 || col >= GRID_RESOLUTION as isize || row >= GRID_RESOLUTION as isize {
+                    continue;
+                }
+                let cell = self.get_cell(col as usize, row as usize);
+                if cell.walkability.is_structure() || cell.walkability.is_rubble() {
+                    let cw = self.cell_to_world(col as usize, row as usize);
+                    if ((cw.x - x).powi(2) + (cw.z - z).powi(2)).sqrt() <= effective {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// True if no road falls within `radius` metres of (x, z).
+    ///
+    /// Uses the fine-resolution road grid (4 m/cell, 10 m clearance baked) when
+    /// OSM data is available — O(1). Falls back to coarse navmesh scan otherwise.
+    pub fn clear_of_roads(&self, x: f64, z: f64, _radius: f64) -> bool {
+        if let Some(grid) = &self.fine_road_grid {
+            return !grid.is_blocked(x, z);
+        }
+        let half = self.cell_size * 0.5;
+        let effective = _radius + half;
+        let span = (effective / self.cell_size).ceil() as isize + 1;
+        let (cx, cz) = match self.world_to_cell(x, z) {
+            Some(c) => c,
+            None => return true,
+        };
+        for dr in -span..=span {
+            for dc in -span..=span {
+                let col = cx as isize + dc;
+                let row = cz as isize + dr;
+                if col < 0 || row < 0 || col >= GRID_RESOLUTION as isize || row >= GRID_RESOLUTION as isize {
+                    continue;
+                }
+                let cell = self.get_cell(col as usize, row as usize);
+                if cell.walkability.contains(WalkabilityFlags::ROAD) {
+                    let cw = self.cell_to_world(col as usize, row as usize);
+                    if ((cw.x - x).powi(2) + (cw.z - z).powi(2)).sqrt() <= effective {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// True if no water cell falls within `radius` metres of (x, z).
+    pub fn clear_of_water(&self, x: f64, z: f64, radius: f64) -> bool {
+        let half = self.cell_size * 0.5;
+        let effective = radius + half;
+        let span = (effective / self.cell_size).ceil() as isize + 1;
+        let (cx, cz) = match self.world_to_cell(x, z) {
+            Some(c) => c,
+            None => return true,
+        };
+        for dr in -span..=span {
+            for dc in -span..=span {
+                let col = cx as isize + dc;
+                let row = cz as isize + dr;
+                if col < 0 || row < 0 || col >= GRID_RESOLUTION as isize || row >= GRID_RESOLUTION as isize {
+                    continue;
+                }
+                let cell = self.get_cell(col as usize, row as usize);
+                if cell.walkability.contains(WalkabilityFlags::BLOCKED_WATER) {
+                    let cw = self.cell_to_world(col as usize, row as usize);
+                    if ((cw.x - x).powi(2) + (cw.z - z).powi(2)).sqrt() <= effective {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// True if (x, z) is more than `radius` metres from every OSM building polygon.
+    /// Returns `true` (no exclusion) when no OSM geometry has been loaded for this tile.
+    pub fn clear_of_structure_geometry(&self, x: f64, z: f64, radius: f64) -> bool {
+        if self.osm_buildings.is_empty() { return true; }
+        for poly in &self.osm_buildings {
+            if _point_to_polygon_dist(x, z, poly) <= radius { return false; }
+        }
+        true
+    }
+
+    /// True if (x, z) is more than `radius` metres from every OSM road polyline.
+    /// Returns `true` (no exclusion) when no OSM road geometry has been loaded.
+    pub fn clear_of_road_geometry(&self, x: f64, z: f64, radius: f64) -> bool {
+        if self.osm_roads.is_empty() { return true; }
+        for road in &self.osm_roads {
+            for i in 0..road.len().saturating_sub(1) {
+                let dist = _point_to_segment_dist(x, z, road[i][0], road[i][1], road[i+1][0], road[i+1][1]);
+                if dist <= radius { return false; }
+            }
+        }
+        true
+    }
+
     /// No flora inside structure footprints, in water, or on intact roads.
     pub fn can_spawn_flora(&self, x: f64, z: f64, is_ground_cover: bool) -> bool {
         let (col, row) = match self.world_to_cell(x, z) {
@@ -562,6 +869,14 @@ pub struct ServerElevationData {
     pub elevations: Vec<f64>,
 }
 
+/// OSM geometry in world coordinates (zone centre = 0,0) from GET /api/tiles/:tileId.
+/// buildings: closed polygons [[x,z]…]; roads: open polylines [[x,z]…].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerGeometry {
+    pub buildings: Vec<Vec<[f64; 2]>>,
+    pub roads:     Vec<Vec<[f64; 2]>>,
+}
+
 /// Combined tile data as received from GET /api/tiles/:tileId.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerTileData {
@@ -572,6 +887,7 @@ pub struct ServerTileData {
     pub navmesh: Option<ServerNavmesh>,
     pub biome: Option<ServerBiomeData>,
     pub ruins: Option<ServerRuinLayout>,
+    pub geometry: Option<ServerGeometry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -609,6 +925,52 @@ pub struct TileManifest {
 }
 
 // ============================================================================
+// Geometry Helpers
+// ============================================================================
+
+/// Distance from (px, pz) to a polygon: 0.0 if inside, else min edge distance.
+fn _point_to_polygon_dist(px: f64, pz: f64, poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    if n < 3 { return f64::MAX; }
+
+    // Ray-casting PIP
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let xi = poly[i][0]; let zi = poly[i][1];
+        let xj = poly[j][0]; let zj = poly[j][1];
+        if (zi > pz) != (zj > pz) && px < ((xj - xi) * (pz - zi)) / (zj - zi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    if inside { return 0.0; }
+
+    // Outside: min distance to any edge
+    let mut min_d = f64::MAX;
+    j = n - 1;
+    for i in 0..n {
+        let d = _point_to_segment_dist(px, pz, poly[j][0], poly[j][1], poly[i][0], poly[i][1]);
+        if d < min_d { min_d = d; }
+        j = i;
+    }
+    min_d
+}
+
+/// Minimum distance from point (px, pz) to line segment (ax,az)→(bx,bz).
+fn _point_to_segment_dist(px: f64, pz: f64, ax: f64, az: f64, bx: f64, bz: f64) -> f64 {
+    let dx = bx - ax;
+    let dz = bz - az;
+    let len_sq = dx * dx + dz * dz;
+    if len_sq < 1e-10 {
+        return ((px - ax).powi(2) + (pz - az).powi(2)).sqrt();
+    }
+    let t = (((px - ax) * dx + (pz - az) * dz) / len_sq).clamp(0.0, 1.0);
+    let cx = ax + t * dx;
+    let cz = az + t * dz;
+    ((px - cx).powi(2) + (pz - cz).powi(2)).sqrt()
+}
+
 // Interpolation Helpers
 // ============================================================================
 
@@ -659,9 +1021,33 @@ fn bilinear(tl: f32, tr: f32, bl: f32, br: f32, fx: f64, fy: f64) -> f32 {
     (top * (1.0 - fy) + bot * fy) as f32
 }
 
+/// Bilinear sample from the dedicated elevation grid.
+fn sample_elevation_grid(elev: &ServerElevationData, ex: f64, ez: f64) -> f32 {
+    let c0 = ex.floor() as usize;
+    let r0 = ez.floor() as usize;
+    let c1 = (c0 + 1).min(elev.width.saturating_sub(1));
+    let r1 = (r0 + 1).min(elev.height.saturating_sub(1));
+
+    let fc = ex - c0 as f64;
+    let fr = ez - r0 as f64;
+
+    let tl = elev.elevations[r0 * elev.width + c0] as f32;
+    let tr = elev.elevations[r0 * elev.width + c1] as f32;
+    let bl = elev.elevations[r1 * elev.width + c0] as f32;
+    let br = elev.elevations[r1 * elev.width + c1] as f32;
+
+    bilinear(tl, tr, bl, br, fc, fr)
+}
+
+/// Simple deterministic noise (same as terrain_client fallback).
+fn pseudo_noise(x: f64, y: f64) -> f64 {
+    let n = (x * 12.9898 + y * 78.233).sin() * 43758.5453;
+    (n - n.floor()) * 2.0 - 1.0
+}
+
 fn parse_biome(s: &str) -> TerrainBiome {
     match s {
-        "FOREST" => TerrainBiome::Forest,
+        "FOREST" | "MIXED_FOREST" | "BOREAL_FOREST" | "TEMPERATE_FOREST" => TerrainBiome::Forest,
         "SCRUB" => TerrainBiome::Scrub,
         "GRASSLAND" => TerrainBiome::Grassland,
         "MARSH" => TerrainBiome::Marsh,

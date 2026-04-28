@@ -1,11 +1,14 @@
 //! Climate subscriber - receives climate updates from climate_sim via Redis
 //!
 //! Caches climate state locally for fast access by simulation.
+//! Tracks freshness so the simulation can fall back to its internal
+//! climate when the external climate_sim is not running.
 
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -34,9 +37,15 @@ pub enum Season {
     Winter,
 }
 
-/// Cached climate state with local storage
+/// How long (ms) before we consider external climate data stale.
+/// The climate_sim publishes at 1 Hz, so 5 seconds means ~5 missed updates.
+const EXTERNAL_STALE_THRESHOLD_MS: u64 = 5000;
+
+/// Cached climate state with local storage and freshness tracking.
 pub struct ClimateCache {
     cached: Arc<RwLock<Option<ClimateSnapshot>>>,
+    /// Wall-clock millis when the last external snapshot was received.
+    last_received_ms: Arc<AtomicU64>,
     zone_id: String,
 }
 
@@ -44,8 +53,22 @@ impl ClimateCache {
     pub fn new(zone_id: String) -> Self {
         Self {
             cached: Arc::new(RwLock::new(None)),
+            last_received_ms: Arc::new(AtomicU64::new(0)),
             zone_id,
         }
+    }
+
+    /// Returns true if the external climate_sim has published fresh data recently.
+    pub fn is_external_active(&self) -> bool {
+        let last = self.last_received_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now.saturating_sub(last) < EXTERNAL_STALE_THRESHOLD_MS
     }
 
     /// Start subscribing to climate updates from Redis
@@ -58,6 +81,7 @@ impl ClimateCache {
         info!("Subscribed to climate updates: {}", channel);
 
         let cached = Arc::clone(&self.cached);
+        let last_received = Arc::clone(&self.last_received_ms);
 
         // Spawn background task to receive updates
         tokio::spawn(async move {
@@ -78,6 +102,11 @@ impl ClimateCache {
                                 "Climate update: Day {} {:?} Temp:{:.2}",
                                 snapshot.day_of_year, snapshot.season, snapshot.temperature
                             );
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            last_received.store(now_ms, Ordering::Relaxed);
                             *cached.write().await = Some(snapshot);
                         }
                         Err(e) => {
@@ -91,7 +120,7 @@ impl ClimateCache {
         Ok(())
     }
 
-    /// Get current climate state (blocks if no data yet)
+    /// Get current climate state (non-blocking)
     pub async fn get(&self) -> Option<ClimateSnapshot> {
         self.cached.read().await.clone()
     }
@@ -105,7 +134,7 @@ impl ClimateCache {
             }
 
             if start.elapsed().as_millis() > timeout_ms as u128 {
-                error!("Timeout waiting for climate data for zone {}", self.zone_id);
+                info!("No external climate data after {}ms for zone {} — will use internal fallback", timeout_ms, self.zone_id);
                 return None;
             }
 

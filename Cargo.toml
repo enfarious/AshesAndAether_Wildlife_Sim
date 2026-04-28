@@ -44,5 +44,8 @@ reqwest = { version = "0.12", features = ["json"] }
 # Bitflags for walkability flags
 bitflags = "2"
 
+# Data-parallelism for per-entity pathfinding
+rayon = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"

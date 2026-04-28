@@ -3,11 +3,13 @@
 //! Climate and time system for the simulation
 //!
 //! Handles day/night cycles, seasons, and environmental conditions.
+//! When the external climate_sim is not publishing to Redis, the
+//! internal `Climate` struct drives climate state as a fallback.
 
 use serde::{Deserialize, Serialize};
 
 // Re-export Season from climate_subscriber for backward compatibility
-pub use crate::climate_subscriber::Season;
+pub use crate::climate_subscriber::{ClimateSnapshot, Season};
 
 impl Season {
     /// Growth rate modifier for plants
@@ -153,6 +155,28 @@ impl Climate {
         let light_mod = if self.is_night() { 0.3 } else { 1.0 };
 
         season_mod * light_mod
+    }
+
+    /// Convert the internal climate state to a ClimateSnapshot.
+    /// Used as the fallback when the external climate_sim is not running.
+    pub fn to_snapshot(&self, zone_id: &str) -> ClimateSnapshot {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        ClimateSnapshot {
+            zone_id: zone_id.to_string(),
+            day_of_year: self.day_of_year,
+            time_of_day: self.time_of_day,
+            year: self.year,
+            season: self.season(),
+            temperature: self.temperature(),
+            day_length: self.day_length(),
+            is_night: self.is_night(),
+            growth_rate: self.growth_rate(),
+            timestamp: now_ms,
+        }
     }
 
     /// Format current date/time as string

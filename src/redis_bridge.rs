@@ -107,16 +107,23 @@ impl RedisBridge {
         self.pubsub_rx.try_recv().ok()
     }
 
-    /// Publish wildlife events to game server
-    pub async fn publish_events(&mut self, events: Vec<WildlifeEvent>) -> Result<()> {
+    /// Publish wildlife events to game server.
+    ///
+    /// Batches events into JSON-array messages, capped at MAX_CHUNK events per
+    /// Redis publish so that initial-spawn floods (100k+ PlantSpawn events) or
+    /// large re-announces don't blow past the subscriber's output-buffer limit
+    /// and cause an ECONNRESET.
+    pub async fn publish_events(&mut self, zone_id: &str, events: Vec<WildlifeEvent>) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
 
-        for event in events {
-            let payload = serde_json::to_string(&event)?;
+        const MAX_CHUNK: usize = 500;
+        let channel = format!("{}:{}", channels::WILDLIFE_EVENTS, zone_id);
+        for chunk in events.chunks(MAX_CHUNK) {
+            let payload = serde_json::to_string(chunk)?;
             self.connection
-                .publish::<_, _, ()>(channels::WILDLIFE_EVENTS, payload)
+                .publish::<_, _, ()>(&channel, payload)
                 .await?;
         }
 

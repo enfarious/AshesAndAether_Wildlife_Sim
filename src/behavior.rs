@@ -183,8 +183,8 @@ fn evaluate_hunt(
         return None;
     }
 
-    // Need to be hungry
-    if entity.needs.hunger > thresholds::NEED_COMFORTABLE {
+    // Predators hunt opportunistically — only stop when nearly full
+    if entity.needs.hunger > 85.0 {
         return None;
     }
 
@@ -304,9 +304,7 @@ fn evaluate_forage(
         return None;
     }
 
-    // Predators hunt opportunistically when prey is nearby
-    // A fox doesn't wait until starving to take a rabbit
-
+    // Herbivores graze and forage for plants — priority scales with hunger
     let mut priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
         95  // Critical: will take risks to hunt
     } else if entity.needs.hunger < thresholds::NEED_LOW {
@@ -667,19 +665,25 @@ pub fn is_prey(self_species: &WildlifeSpecies, other_size: SizeClass) -> bool {
 // Movement Helpers
 // ============================================================================
 
-/// Calculate flee direction (away from threat)
+/// Calculate flee direction (away from threat).
+///
+/// Uses `atan2(dx, dz)` to match the movement convention where
+/// `x += sin(heading) * speed` and `z += cos(heading) * speed`.
 pub fn flee_direction(entity_pos: &Vector3, threat_pos: &Vector3) -> f64 {
     let dx = entity_pos.x - threat_pos.x;
     let dz = entity_pos.z - threat_pos.z;
-    let angle = dz.atan2(dx).to_degrees();
+    let angle = dx.atan2(dz).to_degrees();
     (angle + 360.0) % 360.0
 }
 
-/// Calculate approach direction (toward target)
+/// Calculate approach direction (toward target).
+///
+/// Uses `atan2(dx, dz)` to match the movement convention where
+/// `x += sin(heading) * speed` and `z += cos(heading) * speed`.
 pub fn approach_direction(entity_pos: &Vector3, target_pos: &Vector3) -> f64 {
     let dx = target_pos.x - entity_pos.x;
     let dz = target_pos.z - entity_pos.z;
-    let angle = dz.atan2(dx).to_degrees();
+    let angle = dx.atan2(dz).to_degrees();
     (angle + 360.0) % 360.0
 }
 
@@ -690,8 +694,8 @@ pub fn wander_direction(
     current_heading: f64,
     rng: &mut impl rand::Rng,
 ) -> f64 {
-    // Base: random offset from current heading
-    let random_offset = rng.gen_range(-45.0..45.0);
+    // Base: gentle random offset from current heading for smooth wandering
+    let random_offset = rng.gen_range(-15.0..15.0);
     let mut heading = (current_heading + random_offset + 360.0) % 360.0;
 
     // Bias toward home if far away

@@ -21,13 +21,30 @@ tick_rate = 10
 offline = false
 
 # Game-time multiplier  (60 = 1 real second is 1 game minute)
-time_scale = 60
+time_scale = 30
 
 # Game server URL (terrain API, zone announcements)
-server_url = "http://127.0.0.1:3100"
+server_url = "http://127.0.0.1:5000"
 
 # Tile to load: a specific tile ID, "auto" (first from manifest), or "none"
 tile = "auto"
 
-# Fallback terrain size in world metres (used when server has no tile data)
+# Fallback terrain size in world metres.
+# Only used for procedural terrain when the server has no tile/navmesh data.
+# When real tile data is fetched, tile_size is derived from the navmesh
+# (resolution × cell_size, typically ~2500m for z=14 micro-tiles).
 tile_size = 200.0
+
+# ── Flora density & clearance ───────────────────────────────────────────────
+[flora]
+# Baseline tree density multiplier applied across the whole zone.
+zone_tree_multiplier = 3.0
+
+# Density multiplier inside OSM forest polygons (on top of the zone baseline).
+# Total density in forests = base_density × forest_tree_multiplier.
+forest_tree_multiplier = 10.0
+
+# Minimum clearance distances from obstacles (metres).
+tree_building_clearance = 20.0
+tree_road_clearance     = 10.0
+tree_water_clearance    = 5.0

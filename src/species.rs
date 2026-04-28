@@ -42,8 +42,8 @@ fn rabbit() -> WildlifeSpecies {
         diet_type: DietType::Prey,
         size_class: SizeClass::Tiny, // Tiny so foxes (Small) can hunt them
 
-        base_speed: 2.0,
-        flee_speed_multiplier: 2.5,
+        base_speed: 3.5,
+        flee_speed_multiplier: 3.0,    // Rabbits are explosive sprinters
         swim_capable: false,
         climb_capable: false,
 
@@ -52,9 +52,9 @@ fn rabbit() -> WildlifeSpecies {
         attack_cooldown: 2.0,
         max_health: 15.0,
 
-        sight_range: 20.0,
-        hearing_range: 40.0,
-        smell_range: 15.0,
+        sight_range: 50.0,
+        hearing_range: 80.0,   // Huge ears — excellent hearing
+        smell_range: 30.0,
 
         need_decay_rates: NeedDecayRates {
             hunger: 0.15,
@@ -120,8 +120,8 @@ fn fox() -> WildlifeSpecies {
         diet_type: DietType::Hybrid,
         size_class: SizeClass::Small,
 
-        base_speed: 2.5,
-        flee_speed_multiplier: 2.0,
+        base_speed: 4.0,
+        flee_speed_multiplier: 2.2,
         swim_capable: true,
         climb_capable: false,
 
@@ -130,9 +130,9 @@ fn fox() -> WildlifeSpecies {
         attack_cooldown: 1.5,
         max_health: 35.0,
 
-        sight_range: 35.0,
-        hearing_range: 45.0,
-        smell_range: 50.0,
+        sight_range: 80.0,
+        hearing_range: 90.0,
+        smell_range: 100.0,   // Excellent nose
 
         need_decay_rates: NeedDecayRates {
             hunger: 0.08,
@@ -196,8 +196,8 @@ fn deer() -> WildlifeSpecies {
         diet_type: DietType::Prey,
         size_class: SizeClass::Medium,
 
-        base_speed: 3.0,
-        flee_speed_multiplier: 2.8,
+        base_speed: 5.0,
+        flee_speed_multiplier: 2.8,    // 14 m/s flee (~50 km/h, close to real deer)
         swim_capable: true,
         climb_capable: false,
 
@@ -206,9 +206,9 @@ fn deer() -> WildlifeSpecies {
         attack_cooldown: 2.5,
         max_health: 60.0,
 
-        sight_range: 40.0,
-        hearing_range: 50.0,
-        smell_range: 35.0,
+        sight_range: 120.0,   // Deer spot movement from far away
+        hearing_range: 100.0,
+        smell_range: 60.0,
 
         need_decay_rates: NeedDecayRates {
             hunger: 0.07,
@@ -263,7 +263,7 @@ fn wolf() -> WildlifeSpecies {
         diet_type: DietType::Predator,
         size_class: SizeClass::Medium,
 
-        base_speed: 3.5,
+        base_speed: 5.5,
         flee_speed_multiplier: 1.6,
         swim_capable: true,
         climb_capable: false,
@@ -273,9 +273,9 @@ fn wolf() -> WildlifeSpecies {
         attack_cooldown: 1.2,
         max_health: 75.0,
 
-        sight_range: 40.0,
-        hearing_range: 60.0,
-        smell_range: 80.0,
+        sight_range: 100.0,
+        hearing_range: 120.0,
+        smell_range: 150.0,   // Wolves track by scent from very far
 
         need_decay_rates: NeedDecayRates {
             hunger: 0.055,
@@ -326,7 +326,7 @@ fn boar() -> WildlifeSpecies {
         diet_type: DietType::Hybrid,
         size_class: SizeClass::Medium,
 
-        base_speed: 2.2,
+        base_speed: 3.5,
         flee_speed_multiplier: 2.2,
         swim_capable: true,
         climb_capable: false,
@@ -336,9 +336,9 @@ fn boar() -> WildlifeSpecies {
         attack_cooldown: 1.8,
         max_health: 90.0,
 
-        sight_range: 18.0, // Bad eyesight
-        hearing_range: 35.0,
-        smell_range: 55.0, // Excellent nose
+        sight_range: 35.0,    // Bad eyesight (still their weakness)
+        hearing_range: 70.0,
+        smell_range: 110.0,   // Excellent nose — main detection sense
 
         need_decay_rates: NeedDecayRates {
             hunger: 0.09,

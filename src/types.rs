@@ -311,6 +311,26 @@ pub struct WildlifeEntity {
     // Combat
     pub in_combat: bool,
     pub last_hostile_at: i64,
+
+    // Movement — persisted wander target to prevent path thrashing
+    pub wander_target: Option<Vector3>,
+    pub wander_target_set_at: i64,
+
+    // Cached perception results — these queries scan many terrain cells, so
+    // we refresh them at most every few seconds rather than every tick.
+    #[serde(default)]
+    pub cached_water: Option<Vector3>,
+    #[serde(default)]
+    pub cached_water_at_ms: i64,
+    #[serde(default)]
+    pub cached_shelter: Option<Vector3>,
+    #[serde(default)]
+    pub cached_shelter_at_ms: i64,
+
+    /// Last wallclock-ms at which this entity got an update — used by AI LOD
+    /// to throttle simulation for entities far from any player.
+    #[serde(default)]
+    pub last_update_tick_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +377,9 @@ pub struct PlantEntity {
     pub last_harvested_at: Option<i64>,
 
     pub spawned_at: i64,
+
+    /// Visual variant index (0–4). Assigned at spawn, stable for entity lifetime.
+    pub variant: u8,
 }
 
 // ============================================================================
@@ -386,6 +409,7 @@ pub enum WildlifeEvent {
     },
     Move {
         entity_id: String,
+        from_position: Vector3,
         position: Vector3,
         heading: f64,
         behavior: BehaviorState,
@@ -401,6 +425,14 @@ pub enum WildlifeEvent {
         offspring_ids: Vec<String>,
         position: Vector3,
         zone_id: String,
+    },
+    PlantSpawn {
+        plant_id: String,
+        species_id: String,
+        position: Vector3,
+        zone_id: String,
+        stage: PlantGrowthStage,
+        variant: u8,
     },
     PlantGrow {
         plant_id: String,
