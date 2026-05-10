@@ -25,6 +25,12 @@ pub mod channels {
     /// Game server publishes combat events here
     pub const GAME_COMBAT: &str = "wildlife:combat";
 
+    /// Game server publishes player-driven harvest events here.
+    /// Carries `PlantHarvest` messages — when a player /harvests a plant,
+    /// the server tells the sim to remove it (sim emits PlantEaten back
+    /// through wildlife:events so clients see the plant disappear).
+    pub const GAME_HARVEST: &str = "wildlife:harvest";
+
     /// State sync requests/responses
     pub const STATE_SYNC: &str = "wildlife:sync";
 }
@@ -51,6 +57,7 @@ impl RedisBridge {
         pubsub_conn.subscribe(channels::GAME_PLAYERS).await?;
         pubsub_conn.subscribe(channels::GAME_ZONES).await?;
         pubsub_conn.subscribe(channels::GAME_COMBAT).await?;
+        pubsub_conn.subscribe(channels::GAME_HARVEST).await?;
         pubsub_conn.subscribe(channels::STATE_SYNC).await?;
 
         tokio::spawn(async move {
