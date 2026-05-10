@@ -169,6 +169,20 @@ impl ForestMap {
             Some(g) => g.contains(x, z),
         }
     }
+
+    /// Total polygon area in km², computed from the rasterised grid.
+    /// Returns 0.0 if the map has no polygons (degraded / not loaded).
+    /// Used to scale per-km² densities so forest-pass tree counts adapt
+    /// to how much forest the zone actually has.
+    pub fn area_km2(&self) -> f64 {
+        match &self.grid {
+            None => 0.0,
+            Some(g) => {
+                let true_cells = g.cells.iter().filter(|c| **c).count();
+                (true_cells as f64) * g.cell_size * g.cell_size / 1_000_000.0
+            }
+        }
+    }
 }
 
 /// Ray-casting point-in-polygon. Polygon points are [x, z] pairs.

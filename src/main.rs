@@ -77,11 +77,29 @@ struct CliArgs {
 }
 
 /// Resolved configuration (config file defaults + CLI overrides).
+///
+/// Tree spawning has two passes:
+/// - Zone-wide: `zone_density_per_km2 × zone_area_km2` trees scattered uniformly
+///   across the whole zone (only physical masks reject — water/structures/roads).
+/// - Forest-extra: `forest_density_per_km2 × forest_area_km2` additional trees
+///   inside OSM forest polygons.
+///
+/// In both passes, species is chosen at the candidate position by sampling
+/// `species_by_biome[biome_at(x,z)]`, so geography drives composition: pine
+/// dominates Mountain/Tundra cells, oak/maple dominate Forest/Grassland cells,
+/// and adding palms/mangroves later just means extending the biome tables.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct FloraConfig {
-    zone_tree_multiplier:    f64,
-    forest_tree_multiplier:  f64,
+    /// Trees per km² scattered across the whole zone (any biome with a table entry).
+    zone_density_per_km2: f64,
+    /// Additional trees per km² INSIDE forest polygons, on top of the zone pass.
+    /// Polygon area is measured from the rasterised forest grid at load time.
+    forest_density_per_km2: f64,
+    /// Per-biome species composition table. Values are weights (relative shares,
+    /// auto-normalised). Biomes the zone doesn't have are simply unused; biomes
+    /// with no entry produce no trees at those cells.
+    species_by_biome: HashMap<BiomeType, HashMap<String, f64>>,
     tree_building_clearance: f64,
     tree_road_clearance:     f64,
     tree_water_clearance:    f64,
@@ -89,9 +107,46 @@ struct FloraConfig {
 
 impl Default for FloraConfig {
     fn default() -> Self {
+        let mut species_by_biome: HashMap<BiomeType, HashMap<String, f64>> = HashMap::new();
+
+        let mut forest = HashMap::new();
+        forest.insert("pine_tree".to_string(),  4.0);
+        forest.insert("oak_tree".to_string(),   4.0);
+        forest.insert("maple_tree".to_string(), 2.0);
+        species_by_biome.insert(BiomeType::Forest, forest);
+
+        let mut grassland = HashMap::new();
+        grassland.insert("oak_tree".to_string(),   5.0);
+        grassland.insert("maple_tree".to_string(), 3.0);
+        grassland.insert("pine_tree".to_string(),  2.0);
+        species_by_biome.insert(BiomeType::Grassland, grassland);
+
+        let mut mountain = HashMap::new();
+        mountain.insert("pine_tree".to_string(),  7.0);
+        mountain.insert("oak_tree".to_string(),   2.0);
+        mountain.insert("maple_tree".to_string(), 1.0);
+        species_by_biome.insert(BiomeType::Mountain, mountain);
+
+        let mut tundra = HashMap::new();
+        tundra.insert("pine_tree".to_string(),  9.0);
+        tundra.insert("maple_tree".to_string(), 1.0);
+        species_by_biome.insert(BiomeType::Tundra, tundra);
+
+        let mut coastal = HashMap::new();
+        coastal.insert("maple_tree".to_string(), 4.0);
+        coastal.insert("oak_tree".to_string(),   3.0);
+        coastal.insert("pine_tree".to_string(),  1.0);
+        species_by_biome.insert(BiomeType::Coastal, coastal);
+
+        let mut swamp = HashMap::new();
+        swamp.insert("oak_tree".to_string(),   5.0);
+        swamp.insert("maple_tree".to_string(), 3.0);
+        species_by_biome.insert(BiomeType::Swamp, swamp);
+
         Self {
-            zone_tree_multiplier:    3.0,
-            forest_tree_multiplier:  10.0,
+            zone_density_per_km2:    135.0,
+            forest_density_per_km2:  450.0,
+            species_by_biome,
             tree_building_clearance: 20.0,
             tree_road_clearance:     10.0,
             tree_water_clearance:    5.0,
@@ -193,6 +248,15 @@ async fn main() -> Result<()> {
     info!("  Time scale: {}x (1 sec = {} game sec)", args.time_scale, args.time_scale);
     info!("  Server URL: {}", args.server_url);
     info!("  Tile: {}", args.tile);
+    info!(
+        "  Flora: zone_density={}/km², forest_density={}/km², biomes_in_table={}, clearance(b/r/w)={}/{}/{}",
+        args.flora.zone_density_per_km2,
+        args.flora.forest_density_per_km2,
+        args.flora.species_by_biome.len(),
+        args.flora.tree_building_clearance,
+        args.flora.tree_road_clearance,
+        args.flora.tree_water_clearance,
+    );
 
     if args.offline {
         info!("Running in OFFLINE mode (no Redis)");
@@ -202,7 +266,46 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Spawn a background task that subscribes to the cross-service shutdown
+/// channel and exits the process when the gateway broadcasts SYSTEM_SHUTDOWN.
+/// Doesn't restructure the main busy-loop — just trips process::exit when
+/// the message arrives. Flora cache is already persisted incrementally to
+/// disk so abrupt exit is acceptable; running entity state is regenerated
+/// from population density on next start anyway.
+async fn spawn_shutdown_listener(redis_url: String) {
+    tokio::spawn(async move {
+        let client = match redis::Client::open(redis_url.clone()) {
+            Ok(c) => c,
+            Err(e) => { warn!("shutdown listener: failed to open redis client: {}", e); return; }
+        };
+        let mut pubsub = match client.get_async_pubsub().await {
+            Ok(p) => p,
+            Err(e) => { warn!("shutdown listener: failed to get pubsub: {}", e); return; }
+        };
+        if let Err(e) = pubsub.subscribe("system:shutdown").await {
+            warn!("shutdown listener: failed to subscribe: {}", e);
+            return;
+        }
+        info!("Subscribed to system:shutdown");
+        use futures_util::StreamExt;
+        let mut stream = pubsub.on_message();
+        while let Some(msg) = stream.next().await {
+            let payload: String = match msg.get_payload() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Substring match on type field — avoids dragging serde_json
+            // imports into main just to peek at the envelope.
+            if payload.contains("\"system_shutdown_commit\"") {
+                info!("system:shutdown received from gateway — exiting");
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 async fn run_with_redis(args: Config) -> Result<()> {
+    spawn_shutdown_listener(args.redis.clone()).await;
     let mut bridge = redis_bridge::RedisBridge::connect(&args.redis).await?;
 
     // Zone simulations - will be populated from game server messages
@@ -226,8 +329,6 @@ async fn run_with_redis(args: Config) -> Result<()> {
 
     let tick_duration = Duration::from_secs_f64(1.0 / args.tick_rate as f64);
     let mut last_tick = Instant::now();
-    let mut last_reannounce = Instant::now();
-    let reannounce_interval = Duration::from_secs(15);
 
     info!("Entering main loop ({} zone(s) active)...", zones.len());
 
@@ -243,18 +344,13 @@ async fn run_with_redis(args: Config) -> Result<()> {
             let max_delta = (tick_duration.as_secs_f64() * 2.0).min(0.25);
             let delta_seconds = elapsed.as_secs_f64().min(max_delta);
 
-            // Process incoming messages
+            // Process incoming messages. ZoneInfo for an already-known zone
+            // triggers a one-shot re-announce inside handle_game_message —
+            // that's the only resync path. No periodic heartbeat: the bridge
+            // owns per-player AoI hysteresis and event-driven adds/removes
+            // cover normal operation.
             while let Some(msg) = bridge.try_recv() {
                 handle_game_message(&mut zones, msg, &args.redis, &args.server_url, &terrain, args.time_scale, &args.flora).await;
-            }
-
-            // Periodically re-announce all entities so that late-connecting
-            // or restarted game servers can rebuild their entity registry.
-            if now.duration_since(last_reannounce) >= reannounce_interval {
-                for zone in zones.values_mut() {
-                    zone.re_announce_all();
-                }
-                last_reannounce = now;
             }
 
             // Update all zones
@@ -290,6 +386,10 @@ async fn run_with_redis(args: Config) -> Result<()> {
 }
 
 async fn run_offline(args: Config) -> Result<()> {
+    // Even in offline mode we still subscribe — the redis bridge initializes
+    // for climate + event publishing below, so the system:shutdown channel
+    // is available too.
+    spawn_shutdown_listener(args.redis.clone()).await;
     // Initialize terrain
     let terrain = load_terrain(&args).await;
 
@@ -360,8 +460,6 @@ async fn run_offline(args: Config) -> Result<()> {
 
     let tick_duration = Duration::from_secs_f64(1.0 / args.tick_rate as f64);
     let mut last_tick = Instant::now();
-    let mut last_reannounce = Instant::now();
-    let reannounce_interval = Duration::from_secs(15);
 
     info!("Running offline simulation...");
 
@@ -373,13 +471,6 @@ async fn run_offline(args: Config) -> Result<()> {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let max_delta = (tick_duration.as_secs_f64() * 2.0).min(0.25);
             let delta_seconds = elapsed.as_secs_f64().min(max_delta);
-
-            // Periodically re-announce all entities so that late-connecting
-            // or restarted game servers can rebuild their entity registry.
-            if now.duration_since(last_reannounce) >= reannounce_interval {
-                zone.re_announce_all();
-                last_reannounce = now;
-            }
 
             zone.update(now_ms, delta_seconds).await;
 
@@ -647,11 +738,24 @@ async fn handle_game_message(
             }
         }
 
-        GameServerMessage::PlantHarvest { plant_id, .. } => {
-            // Find and mark plant as harvested
+        GameServerMessage::PlantHarvest { plant_id, player_id } => {
+            // Mark plant as harvested AND emit a PlantEaten event so the
+            // wildlife bridge propagates the removal to clients (otherwise
+            // the plant entity would silently disappear from the sim but
+            // keep rendering on every client until next zone-load).
             for zone in zones.values_mut() {
-                if let Some(plant) = zone.plants.get_mut(&plant_id) {
+                let found = if let Some(plant) = zone.plants.get_mut(&plant_id) {
                     plant.is_alive = false;
+                    true
+                } else {
+                    false
+                };
+                if found {
+                    zone.pending_events.push(WildlifeEvent::PlantEaten {
+                        plant_id: plant_id.clone(),
+                        wildlife_id: player_id.clone(),
+                        food_value: 0.0,
+                    });
                     break;
                 }
             }

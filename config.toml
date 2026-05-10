@@ -36,15 +36,60 @@ tile = "auto"
 tile_size = 200.0
 
 # ── Flora density & clearance ───────────────────────────────────────────────
+# Two passes:
+#   1. Zone-wide:   zone_density_per_km2 × zone_area_km2 trees scattered uniformly
+#                   across the whole zone (only physical masks reject:
+#                   water/structures/roads).
+#   2. Forest-extra: forest_density_per_km2 × forest_polygon_area_km2 additional
+#                    trees inside OSM forest polygons. Polygon area is measured
+#                    from the rasterised forest grid at load time, so a zone with
+#                    5 km² of forest gets 5× the forest-extra trees of one with
+#                    1 km² — instead of all zones cramming the same count into
+#                    however much polygon area they happen to have.
+#
+# At each candidate position the species is sampled from
+# species_by_biome[biome_at(x,z)], so geography drives composition: Mountain
+# cells skew pine, Coastal cells skew maple, Tundra is near-pure pine. Adding
+# palms/mangroves later means extending the biome tables — no code change.
 [flora]
-# Baseline tree density multiplier applied across the whole zone.
-zone_tree_multiplier = 3.0
-
-# Density multiplier inside OSM forest polygons (on top of the zone baseline).
-# Total density in forests = base_density × forest_tree_multiplier.
-forest_tree_multiplier = 10.0
+# Trees per km² zone-wide.
+zone_density_per_km2   = 135.0
+# Additional trees per km² inside forest polygons.
+forest_density_per_km2 = 1000.0
 
 # Minimum clearance distances from obstacles (metres).
 tree_building_clearance = 20.0
 tree_road_clearance     = 10.0
 tree_water_clearance    = 5.0
+
+# ── Per-biome species composition (weights, auto-normalised) ───────────────
+# Biomes the zone doesn't have are simply unused. Biomes with no table entry
+# produce no trees at those cells (e.g. Desert/Urban/Freshwater here).
+
+[flora.species_by_biome.forest]
+pine_tree  = 4.0
+oak_tree   = 4.0
+maple_tree = 2.0
+
+[flora.species_by_biome.grassland]
+oak_tree   = 5.0
+maple_tree = 3.0
+pine_tree  = 2.0
+
+[flora.species_by_biome.mountain]
+pine_tree  = 7.0
+oak_tree   = 2.0
+maple_tree = 1.0
+
+[flora.species_by_biome.tundra]
+pine_tree  = 9.0
+maple_tree = 1.0
+
+[flora.species_by_biome.coastal]
+maple_tree = 4.0
+oak_tree   = 3.0
+pine_tree  = 1.0
+
+[flora.species_by_biome.swamp]
+oak_tree   = 5.0
+maple_tree = 3.0

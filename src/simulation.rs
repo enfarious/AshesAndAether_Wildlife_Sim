@@ -47,6 +47,46 @@ struct PathRequest {
 
 const ELDER_AGE_MULTIPLIER: f64 = 3.0;
 
+/// Per-biome tree species table — Vec for stable iteration order + a
+/// precomputed total weight so weighted sampling doesn't resum on every pick.
+/// Built from the config HashMap once at `set_flora_config` time.
+#[derive(Debug, Clone, Default)]
+pub struct BiomeTreeTable {
+    /// (species_id, weight) pairs. Order is stable across runs.
+    pub species: Vec<(String, f64)>,
+    /// Sum of all weights — used as the upper bound for the random roll.
+    pub total_weight: f64,
+}
+
+impl BiomeTreeTable {
+    fn from_map(map: &HashMap<String, f64>) -> Self {
+        // Keep config order deterministic by sorting species alphabetically.
+        let mut species: Vec<(String, f64)> = map
+            .iter()
+            .filter(|(_, w)| **w > 0.0)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        species.sort_by(|a, b| a.0.cmp(&b.0));
+        let total_weight = species.iter().map(|(_, w)| *w).sum();
+        Self { species, total_weight }
+    }
+
+    /// Weighted-pick a species id. Returns None if the table is empty.
+    fn pick<R: Rng>(&self, rng: &mut R) -> Option<&str> {
+        if self.species.is_empty() || self.total_weight <= 0.0 {
+            return None;
+        }
+        let mut roll = rng.gen_range(0.0..self.total_weight);
+        for (name, weight) in &self.species {
+            if roll < *weight {
+                return Some(name.as_str());
+            }
+            roll -= weight;
+        }
+        self.species.last().map(|(n, _)| n.as_str())
+    }
+}
+
 /// A single entry in the on-disk flora position cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPlant {
@@ -138,8 +178,16 @@ pub struct ZoneSimulation {
     tree_structure_clearance: f64,
     tree_road_clearance: f64,
     tree_water_clearance: f64,
-    tree_zone_multiplier: f64,
-    tree_forest_multiplier: f64,
+    /// Trees per km² scattered zone-wide (pass 1).
+    tree_zone_density_per_km2: f64,
+    /// Additional trees per km² inside forest polygons (pass 2).
+    tree_forest_density_per_km2: f64,
+    /// Per-biome species composition. At each candidate position, the biome
+    /// at (x,z) is looked up and a species is weighted-sampled from this
+    /// biome's table. Biomes with no entry produce no trees at those cells.
+    /// Stored as a Vec for stable iteration + precomputed total weight so
+    /// the spawn hot path doesn't re-sum on every pick.
+    tree_species_by_biome: HashMap<BiomeType, BiomeTreeTable>,
 
     // Water sources (fallback when no terrain)
     pub water_sources: Vec<Vector3>,
@@ -197,8 +245,9 @@ impl ZoneSimulation {
             tree_structure_clearance: 20.0,
             tree_road_clearance: 10.0,
             tree_water_clearance: 5.0,
-            tree_zone_multiplier: 3.0,
-            tree_forest_multiplier: 10.0,
+            tree_zone_density_per_km2:   135.0,
+            tree_forest_density_per_km2: 450.0,
+            tree_species_by_biome: HashMap::new(),
             water_sources: Vec::new(),
 
             last_update_ms: 0,
@@ -295,13 +344,43 @@ impl ZoneSimulation {
         self.forest_map = map;
     }
 
-    /// Configure how far trees must be from building footprints and roads.
+    /// Configure clearance distances, per-pass densities, and the per-biome
+    /// species composition table from the parsed FloraConfig.
     pub fn set_flora_config(&mut self, cfg: &crate::FloraConfig) {
         self.tree_structure_clearance = cfg.tree_building_clearance;
         self.tree_road_clearance      = cfg.tree_road_clearance;
         self.tree_water_clearance     = cfg.tree_water_clearance;
-        self.tree_zone_multiplier     = cfg.zone_tree_multiplier;
-        self.tree_forest_multiplier   = cfg.forest_tree_multiplier;
+        self.tree_zone_density_per_km2   = cfg.zone_density_per_km2;
+        self.tree_forest_density_per_km2 = cfg.forest_density_per_km2;
+
+        // Compile the config HashMap into BiomeTreeTable structs (sorted +
+        // total weight cached). Drop biomes whose table has no positive weights.
+        self.tree_species_by_biome.clear();
+        for (biome, species_map) in &cfg.species_by_biome {
+            let table = BiomeTreeTable::from_map(species_map);
+            if !table.species.is_empty() {
+                self.tree_species_by_biome.insert(*biome, table);
+            }
+        }
+
+        // Validate species ids against the registry; warn loudly on misses
+        // since silent zero-trees-from-this-biome would be hard to debug.
+        let mut bad: Vec<String> = Vec::new();
+        for table in self.tree_species_by_biome.values() {
+            for (sp, _) in &table.species {
+                if get_plant_species(sp).is_none() {
+                    bad.push(sp.clone());
+                }
+            }
+        }
+        if !bad.is_empty() {
+            bad.sort();
+            bad.dedup();
+            tracing::warn!(
+                "FloraConfig references unknown species: {:?} — they will be picked but spawn nothing",
+                bad
+            );
+        }
     }
 
     /// Set terrain data and update bounds to match.
@@ -2396,6 +2475,105 @@ impl ZoneSimulation {
         self.spawn_plant_inner(species_id, now_ms, rng, true, true)
     }
 
+    /// Spawn a single tree. Picks a candidate position, applies physical
+    /// masks, then samples a species from `tree_species_by_biome[biome_at(pos)]`.
+    /// `forest_only=true` further constrains positions to OSM forest polygons.
+    /// Returns the spawned plant id, or None if no valid position was found
+    /// in the attempt budget.
+    ///
+    /// Replaces the old "fixed species → reject by preferred_biomes" model:
+    /// the candidate position is now position-first, species-second, so
+    /// geography drives composition (Mountain → pine, Coastal → maple, etc).
+    fn spawn_tree_inner(&mut self, now_ms: i64, rng: &mut impl Rng, forest_only: bool) -> Option<String> {
+        let max_attempts = if forest_only { 300 } else { 100 };
+
+        // Phase 1: find a valid (position, species) pair. Hold only immutable
+        // borrows so the BiomeTreeTable lookup doesn't fight the &mut self
+        // we'll need in phase 2 for plant insertion.
+        let chosen: Option<(Vector3, String)> = {
+            let terrain = self.terrain.as_ref()?;
+            let mut found = None;
+            for _ in 0..max_attempts {
+                let x = rng.gen_range(self.bounds_min.x..self.bounds_max.x);
+                let z = rng.gen_range(self.bounds_min.z..self.bounds_max.z);
+
+                if !terrain.can_spawn_flora(x, z, false) { continue; }
+                if !terrain.clear_of_structures(x, z, self.tree_structure_clearance) { continue; }
+                if !terrain.clear_of_roads(x, z, self.tree_road_clearance) { continue; }
+                if !terrain.clear_of_water(x, z, self.tree_water_clearance) { continue; }
+                if !self.civic_map.clear_for_tree(x, z) { continue; }
+
+                let in_forest = !self.forest_map.is_empty() && self.forest_map.contains(x, z);
+                if forest_only && !in_forest { continue; }
+
+                let cell_biome = terrain_biome_to_zone_biome(terrain.get_biome_at(x, z));
+                let species_id = match self.tree_species_by_biome.get(&cell_biome) {
+                    Some(table) => match table.pick(rng) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    },
+                    None => continue, // biome has no entry — no trees here
+                };
+
+                let y = terrain.get_elevation(x, z) as f64;
+                found = Some((Vector3::new(x, y, z), species_id));
+                break;
+            }
+            found
+        };
+
+        let (pos, species_id) = chosen?;
+        self.insert_tree_at(&species_id, pos, now_ms)
+    }
+
+    /// Insert a mature tree at a known-valid position. Used by `spawn_tree_inner`
+    /// after position + species have been picked; not for general use.
+    fn insert_tree_at(&mut self, species_id: &str, pos: Vector3, now_ms: i64) -> Option<String> {
+        let species = get_plant_species(species_id)?;
+
+        let mature_idx = species.growth_stages.iter()
+            .position(|s| s.stage == PlantGrowthStage::Mature)
+            .unwrap_or_else(|| species.growth_stages.len().saturating_sub(1));
+        let stage = species.growth_stages.get(mature_idx)
+            .map(|s| s.stage)
+            .unwrap_or(PlantGrowthStage::Mature);
+
+        let variant = (self.next_plant_id % 5) as u8;
+        let id = format!("plant_{}_{}", species_id, self.next_plant_id);
+        self.next_plant_id += 1;
+
+        let plant = PlantEntity {
+            id: id.clone(),
+            species_id: species_id.to_string(),
+            position: pos,
+            zone_id: self.zone_id.clone(),
+            current_stage: stage,
+            stage_started_at: now_ms,
+            stage_progress: 1.0,
+            stage_index: mature_idx,
+            is_alive: true,
+            is_dormant: false,
+            times_harvested: 0,
+            last_harvested_at: None,
+            spawned_at: now_ms,
+            variant,
+        };
+
+        self.plants.insert(id.clone(), plant);
+        self.plant_grid_dirty = true;
+
+        self.pending_events.push(WildlifeEvent::PlantSpawn {
+            plant_id: id.clone(),
+            species_id: species_id.to_string(),
+            position: pos,
+            zone_id: self.zone_id.clone(),
+            stage,
+            variant,
+        });
+
+        Some(id)
+    }
+
     fn spawn_plant_inner(&mut self, species_id: &str, now_ms: i64, rng: &mut impl Rng, forest_only: bool, start_mature: bool) -> Option<String> {
         let species = get_plant_species(species_id)?;
 
@@ -2429,10 +2607,13 @@ impl ZoneSimulation {
                 let in_forest = is_tree && !self.forest_map.is_empty() && self.forest_map.contains(x, z);
                 if forest_only && !in_forest { continue; }
 
-                // Hybrid: OSM polygon positions are always valid for trees (richer coverage in
-                // known forests); positions outside polygons fall back to terrain biome so zones
-                // without OSM data — e.g. player-created towns — still get procedural tree cover.
-                if !in_forest {
+                // Non-trees outside forest polygons must satisfy the species'
+                // preferred_biomes filter — keeps grass in grasslands, etc.
+                // Trees take a separate code path (`spawn_tree_inner`) that
+                // picks species from the cell's biome instead, so they don't
+                // hit this branch during initial spawn. Organic respawn for
+                // trees doesn't go through this function either.
+                if !in_forest && !is_tree {
                     let cell_biome = terrain_biome_to_zone_biome(terrain.get_biome_at(x, z));
                     if !species.preferred_biomes.contains(&cell_biome) {
                         continue;
@@ -2519,20 +2700,41 @@ impl ZoneSimulation {
     pub fn spawn_initial_flora(&mut self, now_ms: i64) -> Vec<CachedPlant> {
         let mut rng = rand::thread_rng();
         let area = self.zone_area_km2();
-        let zone_mult   = self.tree_zone_multiplier;
-        let forest_mult = self.tree_forest_multiplier;
-        let has_forest  = !self.forest_map.is_empty();
+        let forest_area = self.forest_map.area_km2();
 
-        // (species, base_density_per_km2, minimum, max_zone_wide, max_forest_extra)
+        // Trees — two passes, both with biome-driven species selection.
         //
-        // Caps prevent runaway counts on large zones (41 km² × 2000/km² × 3× = 250k pine
-        // without them). Density still scales normally on small tiles; large tiles hit the cap.
-        let tree_specs: &[(&str, f64, usize, usize, usize)] = &[
-            ("pine_tree",  2000.0,  500,  15_000,  35_000),
-            ("oak_tree",   1500.0,  400,  12_000,  28_000),
-            ("maple_tree", 1000.0,  300,   8_000,  18_000),
-        ];
+        // Pass 1 (zone-wide): zone_density_per_km² × zone_area_km² candidate
+        //   positions scattered uniformly across the whole zone. Physical
+        //   masks (water/structures/roads/civic) reject; biome filter does
+        //   NOT — the species at each position is picked from
+        //   tree_species_by_biome[biome_at(pos)] instead.
+        //
+        // Pass 2 (forest-extra): forest_density_per_km² × forest_polygon_area_km²
+        //   additional positions, each constrained to be inside an OSM forest
+        //   polygon. Same biome-driven species pick — so a Mountain forest
+        //   polygon comes out conifer-heavy, a Coastal one maple-heavy.
+        //
+        // All initial-generation plants start mature so the zone is immediately
+        // full-grown; seed→mature growth applies only to organic respawns.
+        let zone_count   = (self.tree_zone_density_per_km2   * area).round() as usize;
+        let forest_count = (self.tree_forest_density_per_km2 * forest_area).round() as usize;
 
+        let mut zone_spawned   = 0usize;
+        let mut forest_spawned = 0usize;
+        for _ in 0..zone_count {
+            if self.spawn_tree_inner(now_ms, &mut rng, false).is_some() {
+                zone_spawned += 1;
+            }
+        }
+        for _ in 0..forest_count {
+            if self.spawn_tree_inner(now_ms, &mut rng, true).is_some() {
+                forest_spawned += 1;
+            }
+        }
+
+        // Non-tree flora — per-km² densities, biome filter still applies via
+        // species.preferred_biomes (handled by spawn_plant_inner).
         let other_specs: &[(&str, f64, usize)] = &[
             // Ground cover
             ("grass",      300.0,  180),
@@ -2550,28 +2752,6 @@ impl ZoneSimulation {
             ("apple_tree",  25.0,   15),
             ("pear_tree",   20.0,   15),
         ];
-
-        // Trees — zone-wide pass at zone_mult, then forest-only extra pass so
-        // forest polygons reach forest_mult total density.
-        // All initial-generation plants start mature so the forest is immediately
-        // full-grown; seed→mature growth applies only to organically respawned plants.
-        for &(species, density, minimum, max_zone, max_forest) in tree_specs {
-            let zone_count = ((density * zone_mult * area).round() as usize)
-                .max(minimum)
-                .min(max_zone);
-            for _ in 0..zone_count {
-                self.spawn_plant_mature(species, now_ms, &mut rng);
-            }
-            if has_forest && forest_mult > zone_mult {
-                let extra = ((density * (forest_mult - zone_mult) * area).round() as usize)
-                    .min(max_forest);
-                for _ in 0..extra {
-                    self.spawn_plant_forest_mature(species, now_ms, &mut rng);
-                }
-            }
-        }
-
-        // Non-tree flora — unchanged density, no forest multiplier
         for &(species, density, minimum) in other_specs {
             let count = ((density * area).round() as usize).max(minimum);
             for _ in 0..count {
@@ -2580,10 +2760,13 @@ impl ZoneSimulation {
         }
 
         tracing::info!(
-            "Spawned {} flora in zone {} ({:.2} km²)",
+            "Spawned {} flora in zone {} ({:.2} km², forest {:.2} km²): trees zone={}/{}, forest={}/{}",
             self.plants.len(),
             self.zone_id,
-            area
+            area,
+            forest_area,
+            zone_spawned,   zone_count,
+            forest_spawned, forest_count,
         );
 
         self.plants.values()
