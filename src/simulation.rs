@@ -2047,9 +2047,10 @@ impl ZoneSimulation {
     /// already have) so the bridge can rebuild its entity registry.
     pub fn re_announce_all(&mut self) {
         let wildlife_count = self.wildlife.values().filter(|e| e.is_alive).count();
+        let plant_count    = self.plants.values().filter(|p| p.is_alive).count();
         info!(
-            "Re-announcing {} living wildlife for zone {}",
-            wildlife_count, self.zone_id
+            "Re-announcing {} wildlife + {} plants for zone {}",
+            wildlife_count, plant_count, self.zone_id
         );
 
         for entity in self.wildlife.values().filter(|e| e.is_alive) {
@@ -2061,11 +2062,25 @@ impl ZoneSimulation {
             });
         }
 
-        // Plants are intentionally NOT re-announced.  They are static; the
-        // bridge streams them to each player once on join via
-        // streamPlantsOnJoin and the client caches them locally.  Re-emitting
-        // 100k+ PlantSpawn events every 15 s on a slow tick was a major
-        // contributor to over-budget warnings.
+        // Plants must be re-announced too. The earlier "skip plants" comment
+        // came from a 15 s periodic resync that's since been removed — the
+        // bridge now owns AoI/visibility, so re_announce_all only fires on
+        // an actual game-server restart. Without this, the new bridge has
+        // an empty plant map, publishLandscapeManifest never re-fires, and
+        // the client fetches stale (or empty) tree HTTP cache. The bridge
+        // debounces the resulting plant_spawn burst into a single Redis
+        // write via scheduleLandscapePublish, so cost is one HTTP-cached
+        // update regardless of plant count.
+        for plant in self.plants.values().filter(|p| p.is_alive) {
+            self.pending_events.push(WildlifeEvent::PlantSpawn {
+                plant_id:   plant.id.clone(),
+                species_id: plant.species_id.clone(),
+                position:   plant.position,
+                zone_id:    self.zone_id.clone(),
+                stage:      plant.current_stage,
+                variant:    plant.variant,
+            });
+        }
     }
 
     /// Spawn an initial population for a species
