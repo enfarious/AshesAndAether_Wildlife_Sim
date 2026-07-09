@@ -311,8 +311,11 @@ async fn run_with_redis(args: Config) -> Result<()> {
     // Zone simulations - will be populated from game server messages
     let mut zones: HashMap<String, ZoneSimulation> = HashMap::new();
 
-    // Load terrain first so it can be applied to zones as they're created
-    let terrain = load_terrain(&args).await;
+    // Per-zone terrain fetch happens lazily inside handle_game_message —
+    // each zone's OSM buildings/water/roads must come from its own tile,
+    // not a single startup-loaded one. Multi-zone deployments otherwise
+    // wallpaper the first tile's masks across every later zone, putting
+    // trees in townhalls and ponds.
 
     // Try to prime zones from snapshot keys left by the game server.
     // This avoids the race condition where zone info was published before we connected.
@@ -323,7 +326,7 @@ async fn run_with_redis(args: Config) -> Result<()> {
     } else {
         info!("Found {} zone snapshot(s) — priming zones", snapshots.len());
         for msg in snapshots {
-            handle_game_message(&mut zones, msg, &args.redis, &args.server_url, &terrain, args.time_scale, &args.flora).await;
+            handle_game_message(&mut zones, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
         }
     }
 
@@ -350,7 +353,7 @@ async fn run_with_redis(args: Config) -> Result<()> {
             // owns per-player AoI hysteresis and event-driven adds/removes
             // cover normal operation.
             while let Some(msg) = bridge.try_recv() {
-                handle_game_message(&mut zones, msg, &args.redis, &args.server_url, &terrain, args.time_scale, &args.flora).await;
+                handle_game_message(&mut zones, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
             }
 
             // Update all zones
@@ -499,8 +502,10 @@ async fn run_offline(args: Config) -> Result<()> {
 // ── Tree position cache ───────────────────────────────────────────────────────
 
 fn flora_cache_path(zone_id: &str) -> PathBuf {
-    // v5: initial flora spawns at mature stage instead of seed stage.
-    PathBuf::from(format!("data/{}/flora_v5.json", zone_id))
+    // v8 (2026-05-13): fine road-interior grid (3 m) keeps non-ground-cover
+    // off small roads; waterway lines (3 m) now rasterized into water grid
+    // alongside lake polygons so streams aren't flora playgrounds either.
+    PathBuf::from(format!("data/{}/flora_v8.json", zone_id))
 }
 
 fn load_flora_cache(zone_id: &str) -> Option<Vec<CachedPlant>> {
@@ -541,6 +546,26 @@ fn save_flora_cache(zone_id: &str, flora: &[CachedPlant]) {
             }
         }
         Err(e) => warn!("Failed to serialize flora cache: {}", e),
+    }
+}
+
+/// Fetch terrain for a specific zone from the gateway. Returns None if the
+/// fetch fails — caller decides whether to substitute procedural fallback.
+/// Used by `handle_game_message` on every new zone, since OSM building/water/
+/// road polygons differ per zone and must not be shared across zones.
+async fn fetch_zone_terrain(
+    server_url: &str,
+    zone_id: &str,
+    tile_size: f64,
+) -> Option<terrain::TerrainGrid> {
+    let client = terrain_client::TerrainClient::new(server_url);
+    let origin = Vector3::new(-tile_size / 2.0, 0.0, -tile_size / 2.0);
+    match client.fetch_and_build_grid(zone_id, tile_size, origin).await {
+        Ok(grid) => Some(grid),
+        Err(e) => {
+            warn!("Failed to fetch terrain for zone {}: {:#}", zone_id, e);
+            None
+        }
     }
 }
 
@@ -643,7 +668,7 @@ async fn handle_game_message(
     msg: GameServerMessage,
     redis_url: &str,
     server_url: &str,
-    terrain: &Option<terrain::TerrainGrid>,
+    tile_size: f64,
     time_scale: f64,
     flora: &FloraConfig,
 ) {
@@ -671,9 +696,20 @@ async fn handle_game_message(
                     warn!("Failed to init weather: {}", e);
                 }
 
-                // Apply terrain if available
-                if let Some(t) = terrain {
-                    sim.set_terrain(t.clone());
+                // Fetch terrain for THIS zone. Every zone has its own OSM
+                // building/water/road polygons — sharing a single startup
+                // tile across zones puts trees in townhalls and ponds.
+                if let Some(t) = fetch_zone_terrain(server_url, &zone.id, tile_size).await {
+                    sim.set_terrain(t);
+                } else {
+                    warn!(
+                        "Zone {}: no terrain — flora gen will use procedural fallback and AI water-seeking will degrade",
+                        zone.id
+                    );
+                    sim.set_terrain(terrain_client::generate_fallback_terrain(
+                        tile_size,
+                        Vector3::new(-tile_size / 2.0, 0.0, -tile_size / 2.0),
+                    ));
                 }
 
                 // Load forest polygons so trees spawn inside OSM wood/forest areas

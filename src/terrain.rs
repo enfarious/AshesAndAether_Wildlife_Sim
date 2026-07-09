@@ -284,10 +284,29 @@ pub struct TerrainGrid {
     pub osm_buildings: Vec<Vec<[f64; 2]>>,
     /// OSM road polylines in world coords [x, z] (zone centre = 0,0).
     pub osm_roads: Vec<Vec<[f64; 2]>>,
-    /// Fine-resolution building grid for O(1) structure clearance checks.
+    /// OSM closed water polygons (lakes/ponds) in world coords [x, z].
+    pub osm_water_polygons: Vec<Vec<[f64; 2]>>,
+    /// OSM open waterway polylines (rivers/streams/canals) in world coords [x, z].
+    pub osm_waterways: Vec<Vec<[f64; 2]>>,
+    /// Fine-resolution building grid for O(1) structure clearance checks
+    /// (20 m halo baked in — used for tree placement).
     pub(crate) fine_building_grid: Option<FineGrid>,
-    /// Fine-resolution road grid for O(1) road clearance checks.
+    /// Fine-resolution building grid at 0 m clearance — interior-only.
+    /// Used by `can_spawn_flora` so non-trees (grass, herbs, vegetables)
+    /// don't sprout inside building footprints. The 20 m halo grid is
+    /// too aggressive for ground cover; we just want them out of walls.
+    pub(crate) fine_building_inside_grid: Option<FineGrid>,
+    /// Fine-resolution road grid for O(1) tree-road clearance (10 m halo).
     pub(crate) fine_road_grid: Option<FineGrid>,
+    /// Fine-resolution road grid at 3 m — covers the actual driving surface
+    /// without pushing flora 10 m back. Used by `can_spawn_flora` so non-
+    /// ground-cover plants don't sprout in the middle of small roads the
+    /// 50 m navmesh cell can't resolve.
+    pub(crate) fine_road_inside_grid: Option<FineGrid>,
+    /// Fine-resolution water grid: closed polygons at 0 m PLUS open
+    /// waterways at 3 m buffer. Used by both trees (via `clear_of_water`)
+    /// and non-trees (via `can_spawn_flora`).
+    pub(crate) fine_water_grid: Option<FineGrid>,
 }
 
 impl TerrainGrid {
@@ -385,17 +404,44 @@ impl TerrainGrid {
         let osm_roads = server_geometry
             .map(|g| g.roads.clone())
             .unwrap_or_default();
+        let osm_water_polygons = server_geometry
+            .map(|g| g.water_polygons.clone())
+            .unwrap_or_default();
+        let osm_waterways = server_geometry
+            .map(|g| g.waterways.clone())
+            .unwrap_or_default();
 
-        // Bake fine grids for building and road clearance (20 m and 10 m respectively).
-        // Makes `clear_of_structures` / `clear_of_roads` O(1) lookups.
-        let (fine_building_grid, fine_road_grid) = if osm_buildings.is_empty() && osm_roads.is_empty() {
-            (None, None)
+        // Bake fine grids for building / road / water clearance.
+        // - buildings:  20 m halo (trees) + 0 m interior-only (all flora)
+        // - roads:      10 m halo (trees) +  3 m centerline (non-ground-cover)
+        // - water:      0 m polygons (lakes) + 3 m waterway lines (streams)
+        // Both groups baked into the same FineGrid where the semantics
+        // allow (water: union of polygons + waterways).
+        let any_osm = !osm_buildings.is_empty()
+            || !osm_roads.is_empty()
+            || !osm_water_polygons.is_empty()
+            || !osm_waterways.is_empty();
+        let (
+            fine_building_grid,
+            fine_building_inside_grid,
+            fine_road_grid,
+            fine_road_inside_grid,
+            fine_water_grid,
+        ) = if !any_osm {
+            (None, None, None, None, None)
         } else {
-            let mut g = FineGrid::new_empty(origin.x, origin.z, tile_size);
-            let mut r = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut g  = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut gi = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut r  = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut ri = FineGrid::new_empty(origin.x, origin.z, tile_size);
+            let mut w  = FineGrid::new_empty(origin.x, origin.z, tile_size);
             g.rasterize_polygons(&osm_buildings, 20.0);
+            gi.rasterize_polygons(&osm_buildings, 0.0);
             r.rasterize_roads(&osm_roads, 10.0);
-            (Some(g), Some(r))
+            ri.rasterize_roads(&osm_roads, 3.0);
+            w.rasterize_polygons(&osm_water_polygons, 0.0);
+            w.rasterize_roads(&osm_waterways, 3.0);
+            (Some(g), Some(gi), Some(r), Some(ri), Some(w))
         };
 
         Self {
@@ -408,8 +454,13 @@ impl TerrainGrid {
             roads,
             osm_buildings,
             osm_roads,
+            osm_water_polygons,
+            osm_waterways,
             fine_building_grid,
+            fine_building_inside_grid,
             fine_road_grid,
+            fine_road_inside_grid,
+            fine_water_grid,
         }
     }
 
@@ -665,7 +716,15 @@ impl TerrainGrid {
     }
 
     /// True if no water cell falls within `radius` metres of (x, z).
+    ///
+    /// Consults both the closed-water-polygon fine grid (lakes/ponds —
+    /// 4 m precision, when OSM data is loaded) and the navmesh flag scan
+    /// (waterways via polyline buffer + slope fallback). Either layer can
+    /// veto.
     pub fn clear_of_water(&self, x: f64, z: f64, radius: f64) -> bool {
+        if let Some(grid) = &self.fine_water_grid {
+            if grid.is_blocked(x, z) { return false; }
+        }
         let half = self.cell_size * 0.5;
         let effective = radius + half;
         let span = (effective / self.cell_size).ceil() as isize + 1;
@@ -724,17 +783,31 @@ impl TerrainGrid {
 
         let cell = self.get_cell(col, row);
 
-        // No flora in water
+        // No flora in water — check the OSM polygon grid (lakes/ponds) first,
+        // then the navmesh flag (waterways + slope fallback).
+        if let Some(grid) = &self.fine_water_grid {
+            if grid.is_blocked(x, z) { return false; }
+        }
         if cell.walkability.contains(WalkabilityFlags::BLOCKED_WATER) {
             return false;
         }
 
-        // No flora inside ANY structure footprint (even rubble)
+        // No flora inside ANY structure footprint. The 50 m navmesh cell
+        // misses small buildings; the 4 m interior-only grid catches them.
+        if let Some(grid) = &self.fine_building_inside_grid {
+            if grid.is_blocked(x, z) { return false; }
+        }
         if cell.walkability.is_structure() || cell.walkability.is_rubble() {
             return false;
         }
 
-        // No flora on intact roads; ground cover ok on damaged/collapsed roads
+        // No flora on intact roads; ground cover ok on damaged/collapsed roads.
+        // The 4 m road-interior grid catches small roads the 50 m navmesh
+        // cell can't resolve. Ground cover (grass, clover) is still allowed
+        // on road surfaces — only tall flora gets pushed off.
+        if let Some(grid) = &self.fine_road_inside_grid {
+            if grid.is_blocked(x, z) { return is_ground_cover; }
+        }
         if cell.walkability.contains(WalkabilityFlags::ROAD) {
             return is_ground_cover;
         }
@@ -870,11 +943,17 @@ pub struct ServerElevationData {
 }
 
 /// OSM geometry in world coordinates (zone centre = 0,0) from GET /api/tiles/:tileId.
-/// buildings: closed polygons [[x,z]…]; roads: open polylines [[x,z]…].
+/// buildings: closed polygons [[x,z]…]; roads: open polylines [[x,z]…];
+/// water_polygons: closed lake/pond rings; waterways: open polylines
+/// (rivers/streams/canals) — wildlife sim rasterizes each at its own buffer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerGeometry {
     pub buildings: Vec<Vec<[f64; 2]>>,
     pub roads:     Vec<Vec<[f64; 2]>>,
+    #[serde(default, rename = "waterPolygons")]
+    pub water_polygons: Vec<Vec<[f64; 2]>>,
+    #[serde(default)]
+    pub waterways: Vec<Vec<[f64; 2]>>,
 }
 
 /// Combined tile data as received from GET /api/tiles/:tileId.

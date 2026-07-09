@@ -166,10 +166,12 @@ impl TerrainClient {
             .count();
 
         info!(
-            "OSM geometry for tile {}: {} buildings, {} roads",
+            "OSM geometry for tile {}: {} buildings, {} roads, {} water polygons, {} waterways",
             tile_id,
             grid.osm_buildings.len(),
             grid.osm_roads.len(),
+            grid.osm_water_polygons.len(),
+            grid.osm_waterways.len(),
         );
         if !grid.osm_buildings.is_empty() {
             // Log the first building's first vertex to verify coordinate system
@@ -269,8 +271,13 @@ pub fn generate_fallback_terrain(tile_size: f64, origin: Vector3) -> TerrainGrid
         roads: vec![],
         osm_buildings: vec![],
         osm_roads: vec![],
+        osm_water_polygons: vec![],
+        osm_waterways: vec![],
         fine_building_grid: None,
+        fine_building_inside_grid: None,
         fine_road_grid: None,
+        fine_road_inside_grid: None,
+        fine_water_grid: None,
     }
 }
 
