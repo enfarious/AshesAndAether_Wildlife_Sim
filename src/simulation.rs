@@ -182,6 +182,11 @@ pub struct ZoneSimulation {
     tree_zone_density_per_km2: f64,
     /// Additional trees per km² inside forest polygons (pass 2).
     tree_forest_density_per_km2: f64,
+    /// Non-tree flora placement, from FloraConfig.other_flora: (species,
+    /// per-km², minimum). Sorted by species id for deterministic spawn order.
+    /// Empty until set_flora_config runs — which it always does before
+    /// spawn_initial_flora in both the offline and online startup paths.
+    other_flora: Vec<(String, f64, usize)>,
     /// Per-biome species composition. At each candidate position, the biome
     /// at (x,z) is looked up and a species is weighted-sampled from this
     /// biome's table. Biomes with no entry produce no trees at those cells.
@@ -245,8 +250,9 @@ impl ZoneSimulation {
             tree_structure_clearance: 20.0,
             tree_road_clearance: 10.0,
             tree_water_clearance: 5.0,
-            tree_zone_density_per_km2:   135.0,
-            tree_forest_density_per_km2: 450.0,
+            tree_zone_density_per_km2:   1500.0,
+            tree_forest_density_per_km2: 600.0,
+            other_flora:                 Vec::new(),
             tree_species_by_biome: HashMap::new(),
             water_sources: Vec::new(),
 
@@ -352,6 +358,18 @@ impl ZoneSimulation {
         self.tree_water_clearance     = cfg.tree_water_clearance;
         self.tree_zone_density_per_km2   = cfg.zone_density_per_km2;
         self.tree_forest_density_per_km2 = cfg.forest_density_per_km2;
+
+        // Non-tree flora. Sorted by species id so spawn ORDER is deterministic:
+        // HashMap iteration order is arbitrary and every spawn draws from the
+        // same rng, so an unsorted walk would generate a different world on
+        // every run from identical config.
+        let mut others: Vec<(String, f64, usize)> = cfg
+            .other_flora
+            .iter()
+            .map(|(id, spec)| (id.clone(), spec.density_per_km2, spec.minimum))
+            .collect();
+        others.sort_by(|a, b| a.0.cmp(&b.0));
+        self.other_flora = others;
 
         // Compile the config HashMap into BiomeTreeTable structs (sorted +
         // total weight cached). Drop biomes whose table has no positive weights.
@@ -2750,25 +2768,21 @@ impl ZoneSimulation {
 
         // Non-tree flora — per-km² densities, biome filter still applies via
         // species.preferred_biomes (handled by spawn_plant_inner).
-        let other_specs: &[(&str, f64, usize)] = &[
-            // Ground cover
-            ("grass",      300.0,  180),
-            ("clover",     150.0,   90),
-            // Vegetables
-            ("carrot",      24.0,   30),
-            ("potato",      18.0,   18),
-            ("onion",       18.0,   18),
-            ("garlic",      12.0,   12),
-            // Herbs / mushrooms / berries
-            ("herb_sage",   24.0,   24),
-            ("mushroom",    30.0,   30),
-            ("berry_bush",  24.0,   24),
-            // Fruit trees
-            ("apple_tree",  25.0,   15),
-            ("pear_tree",   20.0,   15),
-        ];
-        for &(species, density, minimum) in other_specs {
-            let count = ((density * area).round() as usize).max(minimum);
+        //
+        // Sourced from [flora.other_flora] in config.toml (see FloraConfig).
+        // This was a hardcoded array here, which quietly made grass density,
+        // mushroom counts, and the ONLY thing placing apple/pear trees
+        // unreachable without a recompile.
+        if self.other_flora.is_empty() {
+            tracing::warn!(
+                "No non-tree flora configured for zone {} — no ground cover, vegetables, \
+                 herbs or fruit trees will spawn. Check [flora.other_flora] in config.toml.",
+                self.zone_id,
+            );
+        }
+        let other_specs = self.other_flora.clone();
+        for (species, density, minimum) in &other_specs {
+            let count = ((density * area).round() as usize).max(*minimum);
             for _ in 0..count {
                 self.spawn_plant_mature(species, now_ms, &mut rng);
             }

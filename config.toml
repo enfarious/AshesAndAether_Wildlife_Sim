@@ -53,14 +53,75 @@ tile_size = 200.0
 # palms/mangroves later means extending the biome tables — no code change.
 [flora]
 # Trees per km² zone-wide.
-zone_density_per_km2   = 135.0
+zone_density_per_km2   = 500.0
 # Additional trees per km² inside forest polygons.
-forest_density_per_km2 = 1000.0
+forest_density_per_km2 = 100.0
 
 # Minimum clearance distances from obstacles (metres).
 tree_building_clearance = 20.0
 tree_road_clearance     = 10.0
 tree_water_clearance    = 5.0
+
+# ── Non-tree flora ─────────────────────────────────────────────────────────
+# Ground cover, vegetables, herbs, mushrooms, berries — and the ORCHARD FRUIT
+# TREES. Apple and pear are NOT placed by the two tree passes above and do not
+# appear in any species_by_biome table; this section is the only thing putting
+# them in the world.
+#
+#   density_per_km2  expected instances per km² of zone area
+#   minimum          floor applied after the density maths, so small zones
+#                    don't round down to barren. 0 = density alone decides.
+#
+# Biome suitability still applies per species via preferred_biomes in
+# plant_species.rs, so raising a density here is a request, not a guarantee.
+#
+# NOTE: changing anything in [flora] alters the flora cache fingerprint, so the
+# zone regenerates on next start automatically. No need to delete
+# data/{zone}/flora_*.json by hand.
+
+[flora.other_flora.grass]
+density_per_km2 = 300.0
+minimum         = 180
+
+[flora.other_flora.clover]
+density_per_km2 = 150.0
+minimum         = 90
+
+[flora.other_flora.carrot]
+density_per_km2 = 24.0
+minimum         = 30
+
+[flora.other_flora.potato]
+density_per_km2 = 18.0
+minimum         = 18
+
+[flora.other_flora.onion]
+density_per_km2 = 18.0
+minimum         = 18
+
+[flora.other_flora.garlic]
+density_per_km2 = 12.0
+minimum         = 12
+
+[flora.other_flora.herb_sage]
+density_per_km2 = 24.0
+minimum         = 24
+
+[flora.other_flora.mushroom]
+density_per_km2 = 30.0
+minimum         = 30
+
+[flora.other_flora.berry_bush]
+density_per_km2 = 24.0
+minimum         = 24
+
+[flora.other_flora.apple_tree]
+density_per_km2 = 25.0
+minimum         = 15
+
+[flora.other_flora.pear_tree]
+density_per_km2 = 20.0
+minimum         = 15
 
 # ── Per-biome species composition (weights, auto-normalised) ───────────────
 # Biomes the zone doesn't have are simply unused. Biomes with no table entry
@@ -72,9 +133,11 @@ oak_tree   = 4.0
 maple_tree = 2.0
 
 [flora.species_by_biome.grassland]
-oak_tree   = 5.0
-maple_tree = 3.0
-pine_tree  = 2.0
+oak_tree    = 5.0
+maple_tree  = 3.0
+pine_tree   = 2.0
+apple_tree  = 0.6
+pear_tree   = 0.4
 
 [flora.species_by_biome.mountain]
 pine_tree  = 7.0
