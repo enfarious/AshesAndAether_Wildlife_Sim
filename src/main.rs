@@ -100,9 +100,35 @@ struct FloraConfig {
     /// auto-normalised). Biomes the zone doesn't have are simply unused; biomes
     /// with no entry produce no trees at those cells.
     species_by_biome: HashMap<BiomeType, HashMap<String, f64>>,
+    /// Everything NOT placed by the two tree passes: ground cover, vegetables,
+    /// herbs, mushrooms, berries, and the orchard fruit trees. Keyed by species
+    /// id from plant_species.rs.
+    ///
+    /// This lived as a hardcoded array inside spawn_initial_flora until now,
+    /// which meant grass density, mushroom counts, and — surprisingly — how
+    /// many apple and pear trees exist in the world were untunable without a
+    /// recompile, and invisible to anyone reading config.toml.
+    other_flora: HashMap<String, OtherFloraSpec>,
     tree_building_clearance: f64,
     tree_road_clearance:     f64,
     tree_water_clearance:    f64,
+}
+
+/// Placement rule for one non-tree species.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct OtherFloraSpec {
+    /// Expected instances per km² of zone area.
+    density_per_km2: f64,
+    /// Floor applied after the density calculation. Small zones would otherwise
+    /// round to almost nothing and read as barren. 0 = density alone decides.
+    minimum: usize,
+}
+
+impl Default for OtherFloraSpec {
+    fn default() -> Self {
+        Self { density_per_km2: 0.0, minimum: 0 }
+    }
 }
 
 impl Default for FloraConfig {
@@ -143,10 +169,38 @@ impl Default for FloraConfig {
         swamp.insert("maple_tree".to_string(), 3.0);
         species_by_biome.insert(BiomeType::Swamp, swamp);
 
+        // Mirrors the array that used to live in spawn_initial_flora, so
+        // behaviour is unchanged when config.toml omits [flora.other_flora].
+        let mut other_flora: HashMap<String, OtherFloraSpec> = HashMap::new();
+        for (id, density, minimum) in [
+            // Ground cover
+            ("grass",      300.0, 180usize),
+            ("clover",     150.0,  90),
+            // Vegetables
+            ("carrot",      24.0,  30),
+            ("potato",      18.0,  18),
+            ("onion",       18.0,  18),
+            ("garlic",      12.0,  12),
+            // Herbs / mushrooms / berries
+            ("herb_sage",   24.0,  24),
+            ("mushroom",    30.0,  30),
+            ("berry_bush",  24.0,  24),
+            // Fruit trees — NOT placed by the tree passes; these are the only
+            // thing putting apple and pear in the world.
+            ("apple_tree",  25.0,  15),
+            ("pear_tree",   20.0,  15),
+        ] {
+            other_flora.insert(
+                id.to_string(),
+                OtherFloraSpec { density_per_km2: density, minimum },
+            );
+        }
+
         Self {
             zone_density_per_km2:    135.0,
             forest_density_per_km2:  450.0,
             species_by_biome,
+            other_flora,
             tree_building_clearance: 20.0,
             tree_road_clearance:     10.0,
             tree_water_clearance:    5.0,
@@ -453,12 +507,14 @@ async fn run_offline(args: Config) -> Result<()> {
     let civic = CivicMap::fetch(&args.server_url, &zone_id_for_forest).await;
     zone.set_civic_map(civic);
 
-    // Flora — load from cache or generate and save.
-    if let Some(cached) = load_flora_cache(&zone_id_for_forest) {
+    // Flora — load from cache or generate and save. The cache key includes a
+    // fingerprint of args.flora, so editing [flora] in config.toml misses the
+    // old cache and regenerates automatically.
+    if let Some(cached) = load_flora_cache(&zone_id_for_forest, &args.flora) {
         zone.load_cached_flora(cached, now_ms);
     } else {
         let flora = zone.spawn_initial_flora(now_ms);
-        save_flora_cache(&zone_id_for_forest, &flora);
+        save_flora_cache(&zone_id_for_forest, &flora, &args.flora);
     }
 
     let tick_duration = Duration::from_secs_f64(1.0 / args.tick_rate as f64);
@@ -501,20 +557,135 @@ async fn run_offline(args: Config) -> Result<()> {
 
 // ── Tree position cache ───────────────────────────────────────────────────────
 
-fn flora_cache_path(zone_id: &str) -> PathBuf {
+fn flora_cache_path(zone_id: &str, flora_cfg: &FloraConfig) -> PathBuf {
     // v8 (2026-05-13): fine road-interior grid (3 m) keeps non-ground-cover
     // off small roads; waterway lines (3 m) now rasterized into water grid
     // alongside lake polygons so streams aren't flora playgrounds either.
-    PathBuf::from(format!("data/{}/flora_v8.json", zone_id))
+    //
+    // The trailing fingerprint is a hash of the [flora] config that PRODUCED
+    // this cache. Change any density, clearance, or biome weight and the file
+    // name changes, so the stale cache is simply never found and the zone
+    // regenerates. The bare `v8` only ever tracked CODE changes, which meant a
+    // config edit could be applied correctly, logged correctly, and then
+    // silently bypassed by a cache written under the old settings — a very
+    // expensive afternoon to debug, because a cache hit and a working system
+    // log almost identically.
+    PathBuf::from(format!(
+        "data/{}/flora_v8_{}.json",
+        zone_id,
+        flora_config_fingerprint(flora_cfg)
+    ))
 }
 
-fn load_flora_cache(zone_id: &str) -> Option<Vec<CachedPlant>> {
-    let path = flora_cache_path(zone_id);
-    if !path.exists() { return None; }
+/// Stable 64-bit FNV-1a over a canonical rendering of the flora config.
+///
+/// Deliberately NOT `DefaultHasher`: that is explicitly not stable across Rust
+/// releases, so a toolchain upgrade would silently invalidate every zone's
+/// cache. FNV is fixed forever and fine here — this guards against staleness,
+/// not against an adversary.
+///
+/// HashMap iteration order is nondeterministic, so both the biome map and each
+/// species map are SORTED before hashing. Without that the fingerprint would
+/// change run to run and the cache would never hit at all.
+fn flora_config_fingerprint(cfg: &FloraConfig) -> String {
+    let mut canon = String::new();
+    canon.push_str(&format!(
+        "z={:.4};f={:.4};cb={:.4};cr={:.4};cw={:.4};",
+        cfg.zone_density_per_km2,
+        cfg.forest_density_per_km2,
+        cfg.tree_building_clearance,
+        cfg.tree_road_clearance,
+        cfg.tree_water_clearance,
+    ));
+
+    let mut biomes: Vec<(String, &std::collections::HashMap<String, f64>)> = cfg
+        .species_by_biome
+        .iter()
+        .map(|(b, m)| (format!("{:?}", b), m))
+        .collect();
+    biomes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (biome, species) in biomes {
+        canon.push_str(&biome);
+        canon.push(':');
+        let mut sp: Vec<(&String, &f64)> = species.iter().collect();
+        sp.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, weight) in sp {
+            canon.push_str(&format!("{}={:.4},", name, weight));
+        }
+        canon.push(';');
+    }
+
+    // Non-tree flora must be in the fingerprint too. Leaving it out would
+    // recreate exactly the bug this whole mechanism exists to prevent: edit
+    // grass density, get the old cache, see no change, lose an afternoon.
+    canon.push_str("other:");
+    let mut others: Vec<(&String, &OtherFloraSpec)> = cfg.other_flora.iter().collect();
+    others.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, spec) in others {
+        canon.push_str(&format!(
+            "{}={:.4}/{},",
+            name, spec.density_per_km2, spec.minimum
+        ));
+    }
+    canon.push(';');
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canon.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", hash)
+}
+
+/// Delete flora caches for this zone that were written under a DIFFERENT
+/// config fingerprint. Without this, retuning density a few times leaves a
+/// pile of multi-megabyte orphans in data/{zone}/ that nothing will ever read.
+fn prune_stale_flora_caches(zone_id: &str, keep: &PathBuf) {
+    let dir = PathBuf::from(format!("data/{}", zone_id));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if &path == keep {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.starts_with("flora_v") && name.ends_with(".json") {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!("Pruned stale flora cache {}", path.display()),
+                Err(e) => warn!("Could not prune {}: {}", path.display(), e),
+            }
+        }
+    }
+}
+
+fn load_flora_cache(zone_id: &str, flora_cfg: &FloraConfig) -> Option<Vec<CachedPlant>> {
+    let path = flora_cache_path(zone_id, flora_cfg);
+    if !path.exists() {
+        info!(
+            "No flora cache for zone {} at this config fingerprint ({}) — generating fresh. \
+             This is expected after any [flora] change.",
+            zone_id,
+            path.display()
+        );
+        return None;
+    }
     match std::fs::read_to_string(&path) {
         Ok(s) => match serde_json::from_str::<Vec<CachedPlant>>(&s) {
             Ok(v) => {
-                info!("Loaded {} cached flora for zone {} from {}", v.len(), zone_id, path.display());
+                info!(
+                    "Loaded {} CACHED flora for zone {} from {} — [flora] config is unchanged \
+                     since this was generated, so density edits are NOT being re-applied.",
+                    v.len(),
+                    zone_id,
+                    path.display()
+                );
                 Some(v)
             }
             Err(e) => {
@@ -529,8 +700,8 @@ fn load_flora_cache(zone_id: &str) -> Option<Vec<CachedPlant>> {
     }
 }
 
-fn save_flora_cache(zone_id: &str, flora: &[CachedPlant]) {
-    let path = flora_cache_path(zone_id);
+fn save_flora_cache(zone_id: &str, flora: &[CachedPlant], flora_cfg: &FloraConfig) {
+    let path = flora_cache_path(zone_id, flora_cfg);
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             warn!("Failed to create cache dir {}: {}", dir.display(), e);
@@ -543,6 +714,7 @@ fn save_flora_cache(zone_id: &str, flora: &[CachedPlant]) {
                 warn!("Failed to write flora cache {}: {}", path.display(), e);
             } else {
                 info!("Saved {} flora positions to {}", flora.len(), path.display());
+                prune_stale_flora_caches(zone_id, &path);
             }
         }
         Err(e) => warn!("Failed to serialize flora cache: {}", e),
@@ -725,12 +897,13 @@ async fn handle_game_message(
                     let count = sim.spawn_population(species, males, females, now_ms);
                     info!("  Zone {}: spawned {} {} ({}M + {}F)", zone.id, count, species, males, females);
                 }
-                // Flora — load from cache or generate and save.
-                if let Some(cached) = load_flora_cache(&zone.id) {
+                // Flora — load from cache or generate and save. Cache key is
+                // fingerprinted on the flora config; see flora_cache_path.
+                if let Some(cached) = load_flora_cache(&zone.id, flora) {
                     sim.load_cached_flora(cached, now_ms);
                 } else {
-                    let flora = sim.spawn_initial_flora(now_ms);
-                    save_flora_cache(&zone.id, &flora);
+                    let generated = sim.spawn_initial_flora(now_ms);
+                    save_flora_cache(&zone.id, &generated, flora);
                 }
 
                 zones.insert(zone.id, sim);
