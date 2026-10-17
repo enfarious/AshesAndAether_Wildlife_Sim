@@ -26,6 +26,37 @@ pub struct EnvironmentContext {
     pub on_road: bool,
     /// Whether the entity is near dense vegetation or ruins (cover from threats).
     pub near_cover: bool,
+    /// Wall clock (ms) — drives the idle-bout rhythm in select_behavior.
+    pub now_ms: i64,
+}
+
+/// Idle bouts: animals in the wild spend most of their time standing —
+/// grazing in place, watching, chewing — not pacing. Each animal runs its own
+/// cycle (period + phase hashed from its id, so a herd doesn't freeze and
+/// unfreeze in unison); inside the "still" part of the cycle Idle outranks
+/// casual grazing and wandering, but never real needs (low hunger, thirst,
+/// threats, sleep). Hunting depends on this: a target that never stops is
+/// one you can't reach.
+const BOUT_PERIOD_MIN_S: u64 = 30;
+const BOUT_PERIOD_SPREAD_S: u64 = 25;
+const BOUT_STILL_FRACTION: f64 = 0.6;
+const BOUT_IDLE_PRIORITY: i32 = 62; // > comfortable grazing (60), < low hunger (80)
+
+fn id_hash(id: &str) -> u64 {
+    // FNV-1a: stable across runs (unlike std's RandomState).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn in_idle_bout(entity: &WildlifeEntity, now_ms: i64) -> bool {
+    let h = id_hash(&entity.id);
+    let period = BOUT_PERIOD_MIN_S + h % BOUT_PERIOD_SPREAD_S;
+    let phase = ((now_ms.max(0) as u64) / 1000 + (h >> 16)) % period;
+    (phase as f64) < period as f64 * BOUT_STILL_FRACTION
 }
 
 /// An entity perceived by wildlife
@@ -53,6 +84,36 @@ pub struct BehaviorDecision {
     pub target_id: Option<String>,
     pub target_position: Option<Vector3>,
     pub priority: i32,
+}
+
+/// Pick from a distance-sorted candidate list, preferring the target we have
+/// already committed to.
+///
+/// A challenger must be BOTH `margin` (fraction) and `min_gain` (metres)
+/// closer before it steals focus. Without that deadband, two candidates at
+/// near-equal distance trade rank every tick as the entity drifts, and since
+/// each carries a different `target_position` the animal re-aims left, right,
+/// left before committing — the visible symptom this exists to kill.
+///
+/// PRECONDITION: `candidates` is sorted ascending by `distance`.
+fn sticky_pick<'a>(
+    candidates: &'a [PerceivedEntity],
+    current_target: Option<&str>,
+    margin: f64,
+    min_gain: f64,
+) -> Option<&'a PerceivedEntity> {
+    let nearest = candidates.first()?;
+    match current_target.and_then(|id| candidates.iter().find(|c| c.id == id)) {
+        Some(cur) => {
+            let gain = cur.distance - nearest.distance;
+            if gain >= min_gain && nearest.distance < cur.distance * (1.0 - margin) {
+                Some(nearest)
+            } else {
+                Some(cur)
+            }
+        }
+        None => Some(nearest),
+    }
 }
 
 /// Select the best behavior for an entity given its state and environment
@@ -114,6 +175,20 @@ pub fn select_behavior(
         candidates.push(decision);
     }
 
+    // Idle bout — stand still for a stretch unless something real is going on.
+    // Not mid-meal or mid-drink (those are stationary anyway and own targets).
+    if entity.current_behavior != BehaviorState::Eating
+        && entity.current_behavior != BehaviorState::Drinking
+        && in_idle_bout(entity, context.now_ms)
+    {
+        candidates.push(BehaviorDecision {
+            behavior: BehaviorState::Idle,
+            target_id: None,
+            target_position: None,
+            priority: BOUT_IDLE_PRIORITY,
+        });
+    }
+
     // Default behaviors
     candidates.push(BehaviorDecision {
         behavior: BehaviorState::Wandering,
@@ -127,6 +202,18 @@ pub fn select_behavior(
         target_position: None,
         priority: 10,
     });
+
+    // Incumbent bonus. The priority bands below are discrete jumps at the
+    // NEED_* boundaries, so a need decaying across a threshold flips priority
+    // by 15-25 points — and the behaviours on either side often carry
+    // different targets. A small deadband stops that reading as twitching.
+    // (This generalises what used to be a hand-rolled +10 inside
+    // evaluate_flee, which is why that block is gone.)
+    for c in candidates.iter_mut() {
+        if c.behavior == entity.current_behavior {
+            c.priority += 8;
+        }
+    }
 
     // Select highest priority
     candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
@@ -160,10 +247,8 @@ fn evaluate_flee(
         urgency += 5;
     }
 
-    // Already fleeing? Maintain
-    if entity.current_behavior == BehaviorState::Fleeing {
-        urgency += 10;
-    }
+    // NOTE: the "already fleeing? maintain" bonus that lived here is now the
+    // general incumbent bonus applied in select_behavior.
 
     Some(BehaviorDecision {
         behavior: BehaviorState::Fleeing,
@@ -196,7 +281,14 @@ fn evaluate_hunt(
         }
     }
 
-    let prey = context.nearby_prey.first()?;
+    // Wider deadband than foraging: a committed chase shouldn't be abandoned
+    // because a different rabbit drifted 20 cm closer.
+    let prey = sticky_pick(
+        &context.nearby_prey,
+        entity.target_entity_id.as_deref(),
+        0.35,
+        3.0,
+    )?;
 
     let mut priority = 55;
 
@@ -272,10 +364,12 @@ fn evaluate_eat(
 ) -> Option<BehaviorDecision> {
     // Herbivores eat opportunistically when food is nearby
     // They don't wait until starving - they graze constantly
-    let food = context.nearby_food.first()?;
-    if food.distance > 2.0 {
-        return None;
-    }
+    // Scan for anything actually within reach rather than testing only the
+    // head of the list. This used to be `first()` + a distance gate, which
+    // silently depended on nearby_food being sorted — it wasn't, so an
+    // arbitrary far candidate could veto eating while the animal was standing
+    // on a clover patch.
+    let food = context.nearby_food.iter().find(|f| f.distance <= 2.0)?;
 
     let priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
         85  // Critical: starving
@@ -304,21 +398,30 @@ fn evaluate_forage(
         return None;
     }
 
-    // Herbivores graze and forage for plants — priority scales with hunger
-    let mut priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
-        95  // Critical: will take risks to hunt
+    // Herbivores graze and forage for plants — priority scales with hunger.
+    //
+    // Bands are monotonic and all sit BELOW evaluate_flee's 90: a starving
+    // rabbit should still run from a fox. The previous version computed a 95
+    // for the critical case and then immediately overwrote it with 75 on the
+    // next line, so the 95 branch was dead and the bands were non-monotonic
+    // (critical 75 < low 80). 85 preserves the evident intent — outrank
+    // everything except fleeing — without the dead code.
+    let priority = if entity.needs.hunger < thresholds::NEED_CRITICAL {
+        85  // Starving: outranks all but fleeing
     } else if entity.needs.hunger < thresholds::NEED_LOW {
-        80  // Low: actively hunting
+        80  // Low: actively seeking food
     } else if entity.needs.hunger < thresholds::NEED_COMFORTABLE {
-        60  // Comfortable: opportunistic hunting
+        60  // Comfortable: ordinary grazing
     } else {
-        30  // Full: still might hunt if easy target
+        30  // Full: still drifts toward food, but yields easily
     };
-    if entity.needs.hunger < thresholds::NEED_CRITICAL {
-        priority = 75;
-    }
 
-    let food = context.nearby_food.first();
+    let food = sticky_pick(
+        &context.nearby_food,
+        entity.target_entity_id.as_deref(),
+        0.25,
+        1.5,
+    );
     let (target_id, target_position) = match food {
         Some(f) => (Some(f.id.clone()), Some(f.position)),
         None => (None, None),
@@ -719,4 +822,46 @@ fn blend_angles(a: f64, b: f64, weight: f64) -> f64 {
     let y = a_rad.sin() * (1.0 - weight) + b_rad.sin() * weight;
 
     (y.atan2(x).to_degrees() + 360.0) % 360.0
+}
+
+/// Rotate `current` toward `desired` by at most `max_delta_deg`, taking the
+/// shortest arc. Degrees in, degrees out, normalised to [0, 360).
+///
+/// `approach_direction` and `flee_direction` return an ABSOLUTE bearing with
+/// no reference to where the entity was already facing — unlike
+/// `wander_direction`, which nudges the existing heading. That asymmetry is
+/// why wandering looks smooth and target-directed movement snaps. Everything
+/// that writes a heading should route through here.
+pub fn turn_toward(current: f64, desired: f64, max_delta_deg: f64) -> f64 {
+    // (x + 540) % 360 - 180 maps any angle difference onto the shortest
+    // signed arc in (-180, 180]. The +540 keeps the dividend positive, since
+    // Rust's % takes the sign of the dividend.
+    let diff = ((desired - current + 540.0) % 360.0 - 180.0)
+        .clamp(-max_delta_deg, max_delta_deg);
+    (current + diff + 360.0) % 360.0
+}
+
+/// Maximum heading change in degrees per second.
+///
+/// Smaller animals pivot harder; a stalking predator turns deliberately;
+/// panic overrides both. These are deliberately generous — the goal is to
+/// remove the single-tick 180 snap, not to model real turning circles.
+///
+/// Worth watching: a fleeing deer (14 m/s at 450 deg/s) has a turning radius
+/// of roughly 1.8 m, which is wider than the 1.5 m waypoint arrival radius in
+/// simulation.rs. The arrival snap there covers it, but if you retune these
+/// downward, check that fast movers don't start orbiting their waypoints.
+pub fn max_turn_rate(species: &WildlifeSpecies, behavior: BehaviorState) -> f64 {
+    let base = match species.size_class {
+        SizeClass::Tiny   => 540.0,
+        SizeClass::Small  => 420.0,
+        SizeClass::Medium => 300.0,
+        SizeClass::Large  => 220.0,
+        SizeClass::Huge   => 160.0,
+    };
+    match behavior {
+        BehaviorState::Fleeing  => base * 1.5,
+        BehaviorState::Stalking => base * 0.6,
+        _ => base,
+    }
 }

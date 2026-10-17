@@ -17,6 +17,8 @@ const CIVIC_TREE_CLEARANCE: f64 = 40.0;
 struct AnchorRaw {
     #[serde(rename = "worldX")] x: f64,
     #[serde(rename = "worldZ")] z: f64,
+    /// TOWNHALL, LIBRARY, FIRE_STATION, … (gateway loadCivicAnchors).
+    #[serde(rename = "type", default)] kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +30,7 @@ struct AnchorsResponse {
 struct CivicAnchor {
     x: f64,
     z: f64,
+    kind: String,
 }
 
 /// Set of civic anchor positions for a zone.
@@ -58,7 +61,7 @@ impl CivicMap {
             }
 
             let data: AnchorsResponse = resp.json().await.context("Failed to parse anchors")?;
-            let anchors = data.anchors.into_iter().map(|a| CivicAnchor { x: a.x, z: a.z }).collect::<Vec<_>>();
+            let anchors = data.anchors.into_iter().map(|a| CivicAnchor { x: a.x, z: a.z, kind: a.kind }).collect::<Vec<_>>();
             info!("Loaded {} civic anchors for zone {zone_id}", anchors.len());
             Ok(Self { anchors })
         }
@@ -71,6 +74,16 @@ impl CivicMap {
                 Self { anchors: vec![] }
             }
         }
+    }
+
+    /// Townhall positions — the centres of the town commons (see
+    /// ZoneSimulation::check_commons).
+    pub fn townhalls(&self) -> Vec<(f64, f64)> {
+        self.anchors
+            .iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("TOWNHALL"))
+            .map(|a| (a.x, a.z))
+            .collect()
     }
 
     /// Returns true if (x, z) is far enough from all civic anchors for a tree to spawn.

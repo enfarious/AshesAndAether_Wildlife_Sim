@@ -24,6 +24,27 @@ use tracing::info;
 /// (~1 Hz instead of 10 Hz) — they still update needs and age, but they don't
 /// re-decide behaviour, repath, or move every tick.  Cuts ~90 % of work in
 /// typical scenarios where one player can only "see" a few hundred animals.
+/// How close a player gets before an animal bolts. Animals notice you from
+/// their full sight range but keep grazing until you're inside this — so a
+/// bow (22 m) or staff (18 m) can reach most game, and a melee hunter has to
+/// stalk. An animal that was just HIT counts its attacker as a threat at any
+/// range for its flee window (fleeing_until).
+fn player_flush_range(species: &WildlifeSpecies) -> f64 {
+    match species.id.as_str() {
+        "rabbit" => 7.0,
+        "fox"    => 10.0,
+        "deer"   => 16.0,
+        "boar"   => 9.0,   // bad eyes
+        "wolf"   => 12.0,
+        _        => (species.sight_range * 0.15).clamp(6.0, 16.0),
+    }
+}
+
+/// How far an animal runs from a PLAYER (natural predators keep the
+/// sight-range-scaled bolt). Far enough to break contact, near enough to
+/// follow up.
+const PLAYER_FLEE_DIST_M: f64 = 45.0;
+
 const ACTIVE_RANGE: f64 = 300.0;
 const ACTIVE_RANGE_SQ: f64 = ACTIVE_RANGE * ACTIVE_RANGE;
 
@@ -677,6 +698,7 @@ impl ZoneSimulation {
         // Check wildlife spawns periodically (every 30 seconds)
         if now_ms - self.last_spawn_check_ms > 30_000 {
             self.check_spawns(now_ms, &mut rng);
+            self.check_commons(now_ms, &mut rng);
             self.last_spawn_check_ms = now_ms;
         }
 
@@ -972,9 +994,15 @@ impl ZoneSimulation {
                         // Flee distance scales with species sight range — a deer that
                         // detects a threat at 120 m should run far, not just 30 m.
                         let _threat_dist = entity_pos.distance_2d(threat);
-                        let flee_dist = (species.sight_range * 1.5)
-                            .max(80.0)   // At minimum bolt 80 m
-                            .min(300.0); // Cap to avoid pathing across the whole map
+                        let from_player = decision.target_id.as_ref()
+                            .map_or(false, |id| self.player_positions.iter().any(|p| &p.id == id));
+                        let flee_dist = if from_player {
+                            PLAYER_FLEE_DIST_M
+                        } else {
+                            (species.sight_range * 1.5)
+                                .max(80.0)   // At minimum bolt 80 m
+                                .min(300.0)  // Cap to avoid pathing across the whole map
+                        };
 
                         // Prey/hybrid prefers fleeing toward nearby cover/shelter
                         let mut flee_point = None;
@@ -1139,14 +1167,53 @@ impl ZoneSimulation {
 
                     if dist > 0.01 {
                         let move_dist = speed * delta_seconds;
+                        // Normalised to [0,360) to match approach_direction /
+                        // wander_direction. The raw atan2 that used to land
+                        // here was -180..180, so heading changed convention
+                        // depending on which movement path ran.
+                        let desired = (dx.atan2(dz).to_degrees() + 360.0) % 360.0;
+
                         if move_dist >= dist {
+                            // Arriving this tick. Snap, and take the heading
+                            // outright — the turn happens over a sub-tick
+                            // distance so it isn't visible, and this keeps
+                            // fast movers from orbiting the 1.5 m arrival
+                            // radius instead of reaching the waypoint.
                             entity.position.x = waypoint.x;
                             entity.position.z = waypoint.z;
+                            entity.heading = desired;
                         } else {
-                            entity.position.x += (dx / dist) * move_dist;
-                            entity.position.z += (dz / dist) * move_dist;
+                            let max_delta = max_turn_rate(species, entity.current_behavior)
+                                * delta_seconds;
+                            entity.heading =
+                                turn_toward(entity.heading, desired, max_delta);
+
+                            // Move ALONG the (slewed) heading, not straight at
+                            // the waypoint. Slewing the heading while moving
+                            // on the direct vector would decouple facing from
+                            // motion and render as animals crabbing sideways.
+                            let rad = entity.heading.to_radians();
+                            let nx = entity.position.x + rad.sin() * move_dist;
+                            let nz = entity.position.z + rad.cos() * move_dist;
+
+                            // Arcing can leave the corridor A* validated, so
+                            // re-check. On a reject, cut the corner straight
+                            // at the waypoint, which is known walkable.
+                            let arc_ok = self
+                                .terrain
+                                .as_ref()
+                                .map(|t| t.is_walkable(nx, nz))
+                                .unwrap_or(true);
+
+                            if arc_ok {
+                                entity.position.x = nx;
+                                entity.position.z = nz;
+                            } else {
+                                entity.position.x += (dx / dist) * move_dist;
+                                entity.position.z += (dz / dist) * move_dist;
+                                entity.heading = desired;
+                            }
                         }
-                        entity.heading = dx.atan2(dz).to_degrees();
                     }
 
                     // Set Y from terrain elevation
@@ -1171,6 +1238,14 @@ impl ZoneSimulation {
                             )
                         }
                     };
+
+                    // Slew here too. wander_direction already returns a value
+                    // within 15 deg of the current heading so this is a no-op
+                    // for wandering, but approach_direction and flee_direction
+                    // return absolute bearings and would otherwise snap.
+                    let max_delta =
+                        max_turn_rate(species, entity.current_behavior) * delta_seconds;
+                    let heading = turn_toward(entity.heading, heading, max_delta);
 
                     let rad = heading.to_radians();
                     let dx = rad.sin() * speed * delta_seconds;
@@ -1386,10 +1461,18 @@ impl ZoneSimulation {
             }
         }
 
-        // Check players (always potential threats)
+        // Check players. A player is only a threat inside the species' flush
+        // distance — animals clock you from far off but keep grazing until
+        // you're close. (Previously the full sight range: a deer bolted from
+        // any player within 120 m, so nothing could be hunted.) The player who
+        // just hit it stays a threat at any range until its flee window ends.
+        let flush = player_flush_range(species);
+        let now_ms = chrono::Utc::now().timestamp_millis();
         for player in &self.player_positions {
             let distance = entity.position.distance_to(&player.position);
-            if distance > max_range {
+            let hit_by_them = now_ms < entity.fleeing_until
+                && entity.target_entity_id.as_deref() == Some(player.id.as_str());
+            if !hit_by_them && (distance > max_range || distance > flush) {
                 continue;
             }
 
@@ -1406,10 +1489,13 @@ impl ZoneSimulation {
             }
         }
 
-        // Sort by distance
-        threats.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        prey.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        mates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        // Sort by distance. total_cmp rather than partial_cmp().unwrap():
+        // a single NaN coordinate anywhere would otherwise panic the whole
+        // zone sim inside a sort comparator, which is a miserable crash to
+        // diagnose from a stack trace.
+        threats.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        prey.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        mates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
 
         // Water sources — read from the entity's cached value (refreshed in
         // update_wildlife_entity at most every few seconds) instead of
@@ -1464,6 +1550,15 @@ impl ZoneSimulation {
                     });
                 }
             });
+            // MUST be sorted: evaluate_eat / evaluate_forage treat this list
+            // as nearest-first. It wasn't, because plant_spatial_query walks
+            // cells in fixed dx/dz order and each cell's Vec comes from
+            // rebuild_plant_grid iterating a HashMap — arbitrary order, and
+            // reshuffled on every plant_grid_dirty rebuild (i.e. every time
+            // anything is eaten). Herbivores were therefore targeting an
+            // effectively random plant within smell range, re-rolled
+            // constantly, which is what made them pivot back and forth.
+            food.sort_by(|a, b| a.distance.total_cmp(&b.distance));
             food
         } else {
             Vec::new()
@@ -1518,7 +1613,7 @@ impl ZoneSimulation {
                     }
                 }
             }
-            hazards.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+            hazards.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         }
 
         // Terrain-aware context: shelter, road, cover
@@ -1552,6 +1647,7 @@ impl ZoneSimulation {
             nearby_shelter,
             on_road,
             near_cover,
+            now_ms: chrono::Utc::now().timestamp_millis(),
         }
     }
 
@@ -1924,6 +2020,128 @@ impl ZoneSimulation {
                 self.spawn_population(species_id, respawn_males, respawn_females, now_ms);
             }
         }
+    }
+
+    /// Town commons: keep a little easy prey within reach of every townhall.
+    ///
+    /// Two things empty a town's surroundings: animals only spawn on cells of
+    /// their preferred biome (built-up ground rarely is), and prey flee the
+    /// players who stand around town. New players need something to hunt
+    /// within a short walk (NPE "Pull Your Weight", the Spirit dailies), so
+    /// every 30 s this tops each species up to a small target inside a ring
+    /// around each townhall — outside the square itself, mostly beyond a
+    /// rabbit's sight of the crowd at the doors.
+    ///
+    /// Wandering is a random walk, so commons animals drift off over time;
+    /// the top-up replaces them. A per-species cap (relative to the initial
+    /// spawn density) stops that from inflating the zone's population.
+    fn check_commons(&mut self, now_ms: i64, rng: &mut impl Rng) {
+        const INNER_M: f64 = 80.0;
+        const OUTER_M: f64 = 350.0;
+        const MAX_SPAWNS_PER_CHECK: usize = 4;
+        const POP_CAP_FACTOR: f64 = 1.5;
+        // (species, target inside the ring, initial density /km² — mirrors
+        // density_scaled_populations in main.rs)
+        const TARGETS: &[(&str, usize, f64)] = &[
+            ("rabbit", 12, 30.0),
+            ("deer",    4, 11.0),
+            ("boar",    3,  5.5),
+        ];
+
+        let halls = self.civic_map.townhalls();
+        if halls.is_empty() {
+            return;
+        }
+        let area = self.zone_area_km2();
+        let mut budget = MAX_SPAWNS_PER_CHECK;
+
+        for (hx, hz) in halls {
+            for &(species_id, target, density) in TARGETS {
+                if budget == 0 {
+                    return;
+                }
+                if get_species(species_id).is_none() {
+                    continue;
+                }
+
+                let mut alive_total = 0usize;
+                let mut in_ring = 0usize;
+                for e in self.wildlife.values() {
+                    if !e.is_alive || e.species_id != species_id {
+                        continue;
+                    }
+                    alive_total += 1;
+                    let (dx, dz) = (e.position.x - hx, e.position.z - hz);
+                    if dx * dx + dz * dz <= OUTER_M * OUTER_M {
+                        in_ring += 1;
+                    }
+                }
+
+                let cap = ((density * area * POP_CAP_FACTOR).round() as usize).max(target * 2);
+                if in_ring >= target || alive_total >= cap {
+                    continue;
+                }
+
+                let want = (target - in_ring).min(budget);
+                let mut spawned = 0usize;
+                for _ in 0..want {
+                    let pos = match self.find_commons_position(hx, hz, INNER_M, OUTER_M, rng) {
+                        Some(p) => p,
+                        None => break,
+                    };
+                    let sex = if rng.gen_bool(0.5) { Sex::Male } else { Sex::Female };
+                    if let Some(entity) = self.spawn_entity_with_sex(species_id, pos, now_ms, true, sex) {
+                        self.wildlife.insert(entity.id.clone(), entity);
+                        spawned += 1;
+                        budget -= 1;
+                    }
+                }
+                if spawned > 0 {
+                    tracing::info!(
+                        "Commons: +{} {} near townhall ({:.0}, {:.0}) — {} in ring, target {}",
+                        spawned, species_id, hx, hz, in_ring + spawned, target
+                    );
+                }
+            }
+        }
+    }
+
+    /// Uniform-by-area point in the commons ring that is walkable, inside the
+    /// zone, and not within 40 m of a player (nothing pops into view).
+    fn find_commons_position(
+        &self,
+        hx: f64,
+        hz: f64,
+        inner: f64,
+        outer: f64,
+        rng: &mut impl Rng,
+    ) -> Option<Vector3> {
+        for _ in 0..20 {
+            let angle: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+            let r = rng.gen_range(inner * inner..outer * outer).sqrt();
+            let x = hx + angle.sin() * r;
+            let z = hz + angle.cos() * r;
+            if x < self.bounds_min.x || x > self.bounds_max.x || z < self.bounds_min.z || z > self.bounds_max.z {
+                continue;
+            }
+            let near_player = self.player_positions.iter().any(|p| {
+                let (dx, dz) = (p.position.x - x, p.position.z - z);
+                dx * dx + dz * dz < 40.0 * 40.0
+            });
+            if near_player {
+                continue;
+            }
+            match self.terrain {
+                Some(ref t) => {
+                    if !t.is_walkable(x, z) {
+                        continue;
+                    }
+                    return Some(Vector3::new(x, t.get_elevation(x, z) as f64, z));
+                }
+                None => return Some(Vector3::new(x, 0.0, z)),
+            }
+        }
+        None
     }
 
     fn find_spawn_position(&self, config: &SpawnConfig, rng: &mut impl Rng) -> Option<Vector3> {
