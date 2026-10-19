@@ -19,6 +19,19 @@ struct AnchorRaw {
     #[serde(rename = "worldZ")] z: f64,
     /// TOWNHALL, LIBRARY, FIRE_STATION, … (gateway loadCivicAnchors).
     #[serde(rename = "type", default)] kind: String,
+    /// Beacon ward radius in metres (townhall 500, library 150, …).
+    #[serde(rename = "wardRadius", default = "default_ward")] ward: f64,
+}
+
+fn default_ward() -> f64 { 100.0 }
+
+/// A beacon as the wildlife sees it: where the Aether is held back.
+#[derive(Debug, Clone, Copy)]
+pub struct Beacon {
+    pub x: f64,
+    pub z: f64,
+    pub ward: f64,
+    pub is_townhall: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +44,7 @@ struct CivicAnchor {
     x: f64,
     z: f64,
     kind: String,
+    ward: f64,
 }
 
 /// Set of civic anchor positions for a zone.
@@ -61,7 +75,7 @@ impl CivicMap {
             }
 
             let data: AnchorsResponse = resp.json().await.context("Failed to parse anchors")?;
-            let anchors = data.anchors.into_iter().map(|a| CivicAnchor { x: a.x, z: a.z, kind: a.kind }).collect::<Vec<_>>();
+            let anchors = data.anchors.into_iter().map(|a| CivicAnchor { x: a.x, z: a.z, kind: a.kind, ward: a.ward.max(1.0) }).collect::<Vec<_>>();
             info!("Loaded {} civic anchors for zone {zone_id}", anchors.len());
             Ok(Self { anchors })
         }
@@ -76,14 +90,25 @@ impl CivicMap {
         }
     }
 
-    /// Townhall positions — the centres of the town commons (see
-    /// ZoneSimulation::check_commons).
-    pub fn townhalls(&self) -> Vec<(f64, f64)> {
+    /// Every beacon (civic anchor) with its ward radius.
+    pub fn beacons(&self) -> Vec<Beacon> {
         self.anchors
             .iter()
-            .filter(|a| a.kind.eq_ignore_ascii_case("TOWNHALL"))
-            .map(|a| (a.x, a.z))
+            .map(|a| Beacon { x: a.x, z: a.z, ward: a.ward, is_townhall: a.kind.eq_ignore_ascii_case("TOWNHALL") })
             .collect()
+    }
+
+    /// How sheltered from the Aether (x, z) is, 0..1: 1 inside any beacon's
+    /// ward, fading linearly to 0 at twice the ward radius. Living things
+    /// avoid dense Aether, so prey is weighted toward sheltered ground.
+    pub fn shelter(&self, x: f64, z: f64) -> f64 {
+        let mut best = 0.0f64;
+        for a in &self.anchors {
+            let d = ((a.x - x).powi(2) + (a.z - z).powi(2)).sqrt();
+            let s = if d <= a.ward { 1.0 } else { (1.0 - (d - a.ward) / a.ward).max(0.0) };
+            if s > best { best = s; if best >= 1.0 { break; } }
+        }
+        best
     }
 
     /// Returns true if (x, z) is far enough from all civic anchors for a tree to spawn.

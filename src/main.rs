@@ -220,6 +220,10 @@ struct Config {
     tile: String,
     tile_size: f64,
     flora: FloraConfig,
+    /// Seconds a zone may go without any player before it stops being
+    /// ticked. It resumes the moment a player position arrives for it.
+    /// 0 = never pause (every known zone ticks forever, the old behaviour).
+    idle_pause_secs: u64,
 }
 
 impl Default for Config {
@@ -234,6 +238,7 @@ impl Default for Config {
             tile: "auto".into(),
             tile_size: 200.0,
             flora: FloraConfig::default(),
+            idle_pause_secs: 300,
         }
     }
 }
@@ -302,6 +307,11 @@ async fn main() -> Result<()> {
     info!("  Time scale: {}x (1 sec = {} game sec)", args.time_scale, args.time_scale);
     info!("  Server URL: {}", args.server_url);
     info!("  Tile: {}", args.tile);
+    if args.idle_pause_secs > 0 {
+        info!("  Idle pause: zones with no players for {} s stop ticking", args.idle_pause_secs);
+    } else {
+        info!("  Idle pause: off (every zone ticks)");
+    }
     info!(
         "  Flora: zone_density={}/km², forest_density={}/km², biomes_in_table={}, clearance(b/r/w)={}/{}/{}",
         args.flora.zone_density_per_km2,
@@ -364,6 +374,9 @@ async fn run_with_redis(args: Config) -> Result<()> {
 
     // Zone simulations - will be populated from game server messages
     let mut zones: HashMap<String, ZoneSimulation> = HashMap::new();
+    // Who's been seen where, and which zones are paused (see ZoneActivity).
+    let mut activity: HashMap<String, ZoneActivity> = HashMap::new();
+    let idle_pause_ms = (args.idle_pause_secs as i64) * 1000;
 
     // Per-zone terrain fetch happens lazily inside handle_game_message —
     // each zone's OSM buildings/water/roads must come from its own tile,
@@ -380,7 +393,7 @@ async fn run_with_redis(args: Config) -> Result<()> {
     } else {
         info!("Found {} zone snapshot(s) — priming zones", snapshots.len());
         for msg in snapshots {
-            handle_game_message(&mut zones, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
+            handle_game_message(&mut zones, &mut activity, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
         }
     }
 
@@ -407,13 +420,39 @@ async fn run_with_redis(args: Config) -> Result<()> {
             // owns per-player AoI hysteresis and event-driven adds/removes
             // cover normal operation.
             while let Some(msg) = bridge.try_recv() {
-                handle_game_message(&mut zones, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
+                handle_game_message(&mut zones, &mut activity, msg, &args.redis, &args.server_url, args.tile_size, args.time_scale, &args.flora).await;
             }
 
-            // Update all zones
+            // Update all zones -- except the ones nobody is in.
             let tick_start = Instant::now();
-            for zone in zones.values_mut() {
-                zone.update(now_ms, delta_seconds).await;
+            for (zone_id, zone) in zones.iter_mut() {
+                let a = activity.entry(zone_id.clone()).or_insert_with(|| ZoneActivity::new(now_ms));
+
+                // A bridge only publishes while its zone has players, so
+                // silence means the zone emptied: drop its stale positions
+                // (animals would otherwise keep fleeing from ghosts).
+                if a.has_players && now_ms - a.last_players_ms > PLAYERS_STALE_MS {
+                    zone.update_players(Vec::new());
+                    a.has_players = false;
+                }
+
+                let idle = idle_pause_ms > 0
+                    && !a.has_players
+                    && now_ms - a.last_players_ms > idle_pause_ms;
+                if idle != a.paused {
+                    a.paused = idle;
+                    if idle {
+                        info!("Zone {}: no players for {} s -- pausing simulation", zone_id, idle_pause_ms / 1000);
+                    } else {
+                        info!("Zone {}: players back -- resuming simulation", zone_id);
+                    }
+                }
+
+                // Paused zones skip the (expensive) update, but anything they
+                // queued (a re-announce after a server restart) still goes out.
+                if !a.paused {
+                    zone.update(now_ms, delta_seconds).await;
+                }
 
                 // Publish events
                 let events = zone.take_events();
@@ -492,6 +531,15 @@ async fn run_offline(args: Config) -> Result<()> {
     zone.init_weather(&args.redis).await?;
     info!("Redis initialized (climate + event publishing)");
 
+    // Load forest polygons so trees are restricted to OSM wood/forest areas,
+    // and the civic anchors BEFORE the first spawn: prey is weighted toward
+    // beacon-sheltered ground (spawn_population), which needs the anchors.
+    let zone_id_for_forest = if args.zone == "all" { "test_zone".to_string() } else { args.zone.clone() };
+    let forest = ForestMap::fetch(&args.server_url, &zone_id_for_forest).await;
+    zone.set_forest_map(forest);
+    let civic = CivicMap::fetch(&args.server_url, &zone_id_for_forest).await;
+    zone.set_civic_map(civic);
+
     // Spawn initial populations (density-scaled to zone area)
     let now_ms = chrono::Utc::now().timestamp_millis();
     info!("Zone area: {:.2} km² — scaling populations to match", zone.zone_area_km2());
@@ -499,13 +547,6 @@ async fn run_offline(args: Config) -> Result<()> {
         let count = zone.spawn_population(species, males, females, now_ms);
         info!("  Spawned {} {} ({}M + {}F)", count, species, males, females);
     }
-
-    // Load forest polygons so trees are restricted to OSM wood/forest areas
-    let zone_id_for_forest = if args.zone == "all" { "test_zone".to_string() } else { args.zone.clone() };
-    let forest = ForestMap::fetch(&args.server_url, &zone_id_for_forest).await;
-    zone.set_forest_map(forest);
-    let civic = CivicMap::fetch(&args.server_url, &zone_id_for_forest).await;
-    zone.set_civic_map(civic);
 
     // Flora — load from cache or generate and save. The cache key includes a
     // fingerprint of args.flora, so editing [flora] in config.toml misses the
@@ -835,8 +876,32 @@ fn density_scaled_populations(zone: &ZoneSimulation) -> Vec<(&'static str, usize
         .collect()
 }
 
+/// Bridges publish player positions every 250 ms while their zone has
+/// players; this much silence means it's empty.
+const PLAYERS_STALE_MS: i64 = 2_000;
+
+/// Per-zone presence. A zone that has had no players for the configured
+/// idle_pause_secs stops being ticked: the overworld zones are all loaded at
+/// server boot and never unload, so without this every zone's whole animal
+/// population was simulated around the clock. The zone server's bridge keeps
+/// the last positions, so a returning player sees them where they were.
+struct ZoneActivity {
+    /// Last time a player position arrived for this zone (or when the zone
+    /// was first seen, so new zones get a grace period before pausing).
+    last_players_ms: i64,
+    has_players: bool,
+    paused: bool,
+}
+
+impl ZoneActivity {
+    fn new(now_ms: i64) -> Self {
+        Self { last_players_ms: now_ms, has_players: false, paused: false }
+    }
+}
+
 async fn handle_game_message(
     zones: &mut HashMap<String, ZoneSimulation>,
+    activity: &mut HashMap<String, ZoneActivity>,
     msg: GameServerMessage,
     redis_url: &str,
     server_url: &str,
@@ -911,11 +976,13 @@ async fn handle_game_message(
         }
 
         GameServerMessage::PlayersUpdate { players } => {
-            // Clear ALL zones first so that zones whose players left are
-            // correctly emptied (prevents animals fleeing from stale positions).
-            for zone in zones.values_mut() {
-                zone.update_players(Vec::new());
-            }
+            // Each zone server's bridge publishes ONLY its own zone's players.
+            // This used to clear every zone first, so each message wiped the
+            // players from every other zone -- with two occupied zones, one
+            // zone's animals saw nobody most of the time. Now a message
+            // replaces players only for the zones it names; a zone that stops
+            // reporting is emptied in the tick loop (PLAYERS_STALE_MS).
+            let now_ms = chrono::Utc::now().timestamp_millis();
 
             // Group players by zone
             let mut by_zone: HashMap<String, Vec<PlayerPosition>> = HashMap::new();
@@ -929,6 +996,9 @@ async fn handle_game_message(
             for (zone_id, zone_players) in by_zone {
                 if let Some(zone) = zones.get_mut(&zone_id) {
                     zone.update_players(zone_players);
+                    let a = activity.entry(zone_id.clone()).or_insert_with(|| ZoneActivity::new(now_ms));
+                    a.last_players_ms = now_ms;
+                    a.has_players = true;
                 }
             }
         }

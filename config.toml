@@ -35,6 +35,12 @@ tile = "auto"
 # (resolution × cell_size, typically ~2500m for z=14 micro-tiles).
 tile_size = 200.0
 
+# Seconds a zone can go without any player before it stops being ticked; it
+# resumes the moment a player turns up. Overworld zones never unload on the
+# game server, so without this every zone's animals simulate 24/7.
+# 0 = never pause.
+idle_pause_secs = 300
+
 # ── Flora density & clearance ───────────────────────────────────────────────
 # Two passes:
 #   1. Zone-wide:   zone_density_per_km2 × zone_area_km2 trees scattered uniformly

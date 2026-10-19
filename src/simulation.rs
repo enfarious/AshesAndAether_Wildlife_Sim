@@ -2036,27 +2036,42 @@ impl ZoneSimulation {
     /// the top-up replaces them. A per-species cap (relative to the initial
     /// spawn density) stops that from inflating the zone's population.
     fn check_commons(&mut self, now_ms: i64, rng: &mut impl Rng) {
-        const INNER_M: f64 = 80.0;
-        const OUTER_M: f64 = 350.0;
-        const MAX_SPAWNS_PER_CHECK: usize = 4;
+        const MAX_SPAWNS_PER_CHECK: usize = 6;
         const POP_CAP_FACTOR: f64 = 1.5;
+        // Townhall commons ring and targets (raised 2026-10-19).
+        const HALL_INNER_M: f64 = 80.0;
+        const HALL_OUTER_M: f64 = 350.0;
         // (species, target inside the ring, initial density /km² — mirrors
         // density_scaled_populations in main.rs)
-        const TARGETS: &[(&str, usize, f64)] = &[
-            ("rabbit", 12, 30.0),
-            ("deer",    4, 11.0),
-            ("boar",    3,  5.5),
+        const HALL_TARGETS: &[(&str, usize, f64)] = &[
+            ("rabbit", 16, 30.0),
+            ("deer",    6, 11.0),
+            ("boar",    4,  5.5),
+        ];
+        // Every other beacon (library, fire station, school, …) holds a
+        // smaller commons of its own: animals gather where the Aether is
+        // thin, so each ward is a little island of game.
+        const BEACON_INNER_M: f64 = 25.0;
+        const BEACON_TARGETS: &[(&str, usize, f64)] = &[
+            ("rabbit", 5, 30.0),
+            ("deer",   2, 11.0),
+            ("boar",   1,  5.5),
         ];
 
-        let halls = self.civic_map.townhalls();
-        if halls.is_empty() {
+        let beacons = self.civic_map.beacons();
+        if beacons.is_empty() {
             return;
         }
         let area = self.zone_area_km2();
         let mut budget = MAX_SPAWNS_PER_CHECK;
 
-        for (hx, hz) in halls {
-            for &(species_id, target, density) in TARGETS {
+        for b in beacons {
+            let (inner, outer, targets) = if b.is_townhall {
+                (HALL_INNER_M, HALL_OUTER_M, HALL_TARGETS)
+            } else {
+                (BEACON_INNER_M, (b.ward * 1.2).clamp(60.0, 220.0), BEACON_TARGETS)
+            };
+            for &(species_id, target, density) in targets {
                 if budget == 0 {
                     return;
                 }
@@ -2071,8 +2086,8 @@ impl ZoneSimulation {
                         continue;
                     }
                     alive_total += 1;
-                    let (dx, dz) = (e.position.x - hx, e.position.z - hz);
-                    if dx * dx + dz * dz <= OUTER_M * OUTER_M {
+                    let (dx, dz) = (e.position.x - b.x, e.position.z - b.z);
+                    if dx * dx + dz * dz <= outer * outer {
                         in_ring += 1;
                     }
                 }
@@ -2085,7 +2100,7 @@ impl ZoneSimulation {
                 let want = (target - in_ring).min(budget);
                 let mut spawned = 0usize;
                 for _ in 0..want {
-                    let pos = match self.find_commons_position(hx, hz, INNER_M, OUTER_M, rng) {
+                    let pos = match self.find_commons_position(b.x, b.z, inner, outer, rng) {
                         Some(p) => p,
                         None => break,
                     };
@@ -2098,8 +2113,9 @@ impl ZoneSimulation {
                 }
                 if spawned > 0 {
                     tracing::info!(
-                        "Commons: +{} {} near townhall ({:.0}, {:.0}) — {} in ring, target {}",
-                        spawned, species_id, hx, hz, in_ring + spawned, target
+                        "Commons: +{} {} near {} ({:.0}, {:.0}) — {} in ring, target {}",
+                        spawned, species_id, if b.is_townhall { "townhall" } else { "beacon" },
+                        b.x, b.z, in_ring + spawned, target
                     );
                 }
             }
@@ -2340,10 +2356,20 @@ impl ZoneSimulation {
             .chain(std::iter::repeat(Sex::Female).take(females))
             .collect();
 
+        // Living things avoid dense Aether: prey spawns weighted toward
+        // beacon-sheltered ground, hybrids half as much, predators not at
+        // all (the wilds keep their wolves; the town edges stay huntable).
+        let shelter_bias = match species.diet_type {
+            DietType::Prey => 1.0,
+            DietType::Hybrid => 0.5,
+            DietType::Predator => 0.0,
+        };
+
         for sex in sexes {
             let pos = self.find_walkable_spawn_position(
                 &mut rng,
                 Some(&species.biome_preferences),
+                shelter_bias,
             );
             let pos = match pos {
                 Some(p) => p,
@@ -2362,14 +2388,29 @@ impl ZoneSimulation {
     /// Find a walkable spawn position, using terrain if available.
     /// If `biome_prefs` is provided, only positions matching one of the preferred biomes
     /// (by terrain cell) are accepted.
+    ///
+    /// `shelter_bias` (0..1) weights the pick toward beacon-sheltered ground
+    /// by rejection: a fully exposed cell is kept with probability
+    /// 1 - 0.7 * bias, a sheltered one always — so at bias 1 sheltered
+    /// ground is ~3.3x as likely per unit area as the open wilds.
     fn find_walkable_spawn_position(
         &self,
         rng: &mut impl Rng,
         biome_prefs: Option<&[BiomePreference]>,
+        shelter_bias: f64,
     ) -> Option<Vector3> {
-        for _ in 0..30 {
+        let exposed_keep = 1.0 - 0.7 * shelter_bias.clamp(0.0, 1.0);
+        for _ in 0..60 {
             let x = rng.gen_range(self.bounds_min.x..self.bounds_max.x);
             let z = rng.gen_range(self.bounds_min.z..self.bounds_max.z);
+
+            if exposed_keep < 1.0 {
+                let shelter = self.civic_map.shelter(x, z);
+                let keep = exposed_keep + (1.0 - exposed_keep) * shelter;
+                if keep < 1.0 && !rng.gen_bool(keep) {
+                    continue;
+                }
+            }
 
             if let Some(ref terrain) = self.terrain {
                 if !terrain.is_walkable(x, z) {
